@@ -15,7 +15,6 @@ from PyQt5.QtWidgets import (
     QDockWidget,
     QFileDialog,
     QHeaderView,
-    QLabel,
     QListWidgetItem,
     QMessageBox,
     QSizePolicy,
@@ -48,7 +47,7 @@ from .constants import (
     POINT_SHAPE_NAMES,
     SERIES_POINT_PALETTE,
 )
-from .data_loader import InSARDataset, inspect_dataset, suggest_dimensions
+from .data_loader import InSARDataset, suggest_dimensions
 from .dependencies import (
     DependencyInstallTask,
     dependency_statuses,
@@ -67,7 +66,7 @@ from .models import (
 )
 from .plotting import TimeSeriesPlotWidget
 from .rendering import apply_color_ramp_renderer, list_qgis_color_ramps
-from .tasks import LiveProbePlotTask
+from .tasks import DatasetInspectionTask, DatasetLoadTask, LiveProbePlotTask
 
 if TYPE_CHECKING:
     from qgis.gui import QgisInterface
@@ -121,6 +120,13 @@ class InSARViewerDockWidget(QDockWidget):
         self.live_probe_point: SamplePoint | None = None
         self.live_probe_plot_task: LiveProbePlotTask | None = None
         self.pending_live_probe_point: SamplePoint | None = None
+        self.dataset_inspection_task: DatasetInspectionTask | None = None
+        self.dataset_load_task: DatasetLoadTask | None = None
+        self._current_dataset_load_request: tuple[
+            Path,
+            str,
+            DimensionSelection,
+        ] | None = None
         self.dependency_install_task: DependencyInstallTask | None = None
         self._is_updating_ui = False
 
@@ -235,14 +241,6 @@ class InSARViewerDockWidget(QDockWidget):
             primary_name="selectionGroupBox",
             fallback_name="horizontalGroupBox",
         )
-        self.dataTabStatusLabel = self._find_or_create_status_label(
-            label_name="dataTabStatusLabel",
-            parent_name="dataTab",
-            message=(
-                "Select a file path with Browse, then click Load to inspect the "
-                "dataset."
-            ),
-        )
 
     def _find_widget_with_fallback(
         self,
@@ -265,32 +263,6 @@ class InSARViewerDockWidget(QDockWidget):
                 f"The UI file is missing required widget: {primary_name}"
             )
         return widget
-
-    def _find_or_create_status_label(
-        self,
-        label_name: str,
-        parent_name: str,
-        message: str,
-    ) -> QLabel:
-        """Find a status label or create one when the UI omits it."""
-
-        label = self.findChild(QLabel, label_name)
-        if label is not None:
-            return label
-
-        parent_widget = self.findChild(QWidget, parent_name)
-        if parent_widget is None or parent_widget.layout() is None:
-            logger.error(
-                "Unable to create status label. Missing parent: %s",
-                parent_name,
-            )
-            raise RuntimeError(f"The UI file is missing required parent: {parent_name}")
-
-        label = QLabel(message, parent_widget)
-        label.setObjectName(label_name)
-        label.setWordWrap(True)
-        parent_widget.layout().insertWidget(0, label)
-        return label
 
     def _configure_static_controls(self) -> None:
         """Populate controls with static options."""
@@ -560,14 +532,57 @@ class InSARViewerDockWidget(QDockWidget):
             self._show_error_message("Missing Dataset", "Select a dataset path first.")
             return
 
+        self._cancel_dataset_inspection_task()
+        self._cancel_dataset_load_task()
         self.dataset_path = Path(dataset_text)
-        try:
-            self.dataset_inspection = inspect_dataset(self.dataset_path)
-        except Exception as exc:
-            logger.error("Dataset inspection failed for %s: %s", self.dataset_path, exc)
-            self._show_error_message("Dataset Inspection Failed", str(exc))
+        self.dataset_inspection = None
+        self.dataset = None
+        self.remove_preview_layer()
+        self._cancel_live_probe_task()
+        self.live_probe_point = None
+        self.pending_live_probe_point = None
+        self.overlay_manager.clear_role("live_probe")
+        self._refresh_point_plot()
+        self._set_selection_controls_enabled(False)
+        self.loadSourceButton.setEnabled(False)
+
+        task = DatasetInspectionTask(self.dataset_path)
+        task.inspectionFinished.connect(self._handle_dataset_inspection_finished)
+        self.dataset_inspection_task = task
+        QgsApplication.taskManager().addTask(task)
+
+    def _handle_dataset_inspection_finished(
+        self,
+        success: bool,
+        dataset_path: object,
+        inspection: object,
+        error_message: str,
+    ) -> None:
+        """Handle completion of the background dataset inspection task."""
+
+        self.dataset_inspection_task = None
+        self.loadSourceButton.setEnabled(True)
+
+        if not isinstance(dataset_path, Path):
+            logger.error(
+                "Dataset inspection returned an invalid path: %r",
+                dataset_path,
+            )
+            return
+        if self.dataset_path != dataset_path:
+            return
+        if not success:
+            if error_message and "canceled" not in error_message.casefold():
+                self._show_error_message("Dataset Inspection Failed", error_message)
+            return
+        if not isinstance(inspection, DatasetInspection):
+            logger.error(
+                "Dataset inspection returned an invalid payload for %s.",
+                dataset_path,
+            )
             return
 
+        self.dataset_inspection = inspection
         self._is_updating_ui = True
         self.variableComboBox.clear()
         self.variableComboBox.addItems(self.dataset_inspection.variable_names)
@@ -581,9 +596,6 @@ class InSARViewerDockWidget(QDockWidget):
         self._is_updating_ui = False
 
         self._update_dimension_controls()
-        self.dataTabStatusLabel.setText(
-            "Dataset source loaded. Review the variable and dimension mapping below."
-        )
         self._apply_dataset_selection()
 
     def _handle_variable_change(self) -> None:
@@ -660,33 +672,73 @@ class InSARViewerDockWidget(QDockWidget):
         latitude_name = self.latitudeDimensionComboBox.currentText().strip()
         longitude_name = self.longitudeDimensionComboBox.currentText().strip()
         if not all((variable_name, time_name, latitude_name, longitude_name)):
-            self.dataTabStatusLabel.setText(
-                "Choose Variable, Time, Latitude, and Longitude dimensions."
-            )
             return
 
-        try:
-            self.dataset = InSARDataset.load(
-                self.dataset_path,
-                variable_name=variable_name,
-                dimensions=DimensionSelection(
-                    time=time_name,
-                    latitude=latitude_name,
-                    longitude=longitude_name,
-                ),
-            )
-        except Exception as exc:
-            logger.error("Failed to load dataset %s: %s", self.dataset_path, exc)
-            self._show_error_message("Dataset Load Failed", str(exc))
-            return
-
-        time_size, latitude_size, longitude_size = self.dataset.shape
-        self.dataTabStatusLabel.setText(
-            "Loaded "
-            f"{self.dataset.variable_name} | time={time_size}, "
-            f"lat={latitude_size}, lon={longitude_size} | "
-            f"crs={self._dataset_crs_label()} | Click Render to update the canvas."
+        dimensions = DimensionSelection(
+            time=time_name,
+            latitude=latitude_name,
+            longitude=longitude_name,
         )
+        request = (self.dataset_path, variable_name, dimensions)
+        if request == self._current_dataset_load_request:
+            return
+
+        self._cancel_dataset_load_task()
+        self._current_dataset_load_request = request
+        task = DatasetLoadTask(
+            dataset_path=self.dataset_path,
+            variable_name=variable_name,
+            dimensions=dimensions,
+        )
+        task.datasetLoaded.connect(self._handle_dataset_load_finished)
+        self.dataset_load_task = task
+        QgsApplication.taskManager().addTask(task)
+
+    def _handle_dataset_load_finished(
+        self,
+        success: bool,
+        dataset_path: object,
+        variable_name: str,
+        dimensions: object,
+        dataset: object,
+        error_message: str,
+    ) -> None:
+        """Handle completion of the background dataset load task."""
+
+        request = (
+            dataset_path,
+            variable_name,
+            dimensions,
+        )
+        if request == self._current_dataset_load_request:
+            self.dataset_load_task = None
+            self._current_dataset_load_request = None
+
+        if not isinstance(dataset_path, Path) or not isinstance(
+            dimensions, DimensionSelection
+        ):
+            logger.error(
+                "Dataset load returned invalid request metadata: %r",
+                request,
+            )
+            return
+
+        current_request = self._current_dataset_request()
+        if current_request != request:
+            return
+
+        if not success:
+            if error_message and "canceled" not in error_message.casefold():
+                self._show_error_message("Dataset Load Failed", error_message)
+            return
+        if not isinstance(dataset, InSARDataset):
+            logger.error(
+                "Dataset load returned an invalid payload for %s.",
+                dataset_path,
+            )
+            return
+
+        self.dataset = dataset
         self._populate_time_controls()
         self.remove_preview_layer()
         self._refresh_value_range_from_data()
@@ -908,6 +960,16 @@ class InSARViewerDockWidget(QDockWidget):
         if checked:
             self._render_date_view()
 
+    def _handle_reference_points_change(self) -> None:
+        """Refresh outputs affected by reference-point updates."""
+
+        self._refresh_point_lists()
+        self._refresh_canvas_markers()
+        self._refresh_value_range_from_data()
+        if not self.autoValueRangeCheckBox.isChecked():
+            self._refresh_or_mark_date_render()
+        self._refresh_point_plot()
+
     def _refresh_or_mark_date_render(self) -> None:
         """Render immediately when live render is enabled, otherwise mark pending."""
 
@@ -945,13 +1007,6 @@ class InSARViewerDockWidget(QDockWidget):
             minimum_value=float(self.minValueDoubleSpinBox.value()),
             maximum_value=float(self.maxValueDoubleSpinBox.value()),
         )
-        if self.preview_layer_id is not None:
-            self.dataTabStatusLabel.setText(
-                "Rendered "
-                f"{self.dataset.variable_name} | "
-                f"display={self.compareDateComboBox.currentText()} | "
-                f"crs={self._dataset_crs_label()}"
-            )
 
     def _refresh_value_range_from_data(self) -> None:
         """Refresh the render range from the current slice when auto mode is enabled."""
@@ -1085,12 +1140,30 @@ class InSARViewerDockWidget(QDockWidget):
         if self.dataset is None:
             return
         self.remove_preview_layer()
-        time_size, latitude_size, longitude_size = self.dataset.shape
-        self.dataTabStatusLabel.setText(
-            "Loaded "
-            f"{self.dataset.variable_name} | time={time_size}, "
-            f"lat={latitude_size}, lon={longitude_size} | "
-            f"crs={self._dataset_crs_label()} | Click Render to update the canvas."
+
+    def _current_dataset_request(
+        self,
+    ) -> tuple[Path, str, DimensionSelection] | None:
+        """Return the current dataset-load request derived from the UI state."""
+
+        if self.dataset_path is None:
+            return None
+
+        variable_name = self.variableComboBox.currentText().strip()
+        time_name = self.timeDimensionComboBox.currentText().strip()
+        latitude_name = self.latitudeDimensionComboBox.currentText().strip()
+        longitude_name = self.longitudeDimensionComboBox.currentText().strip()
+        if not all((variable_name, time_name, latitude_name, longitude_name)):
+            return None
+
+        return (
+            self.dataset_path,
+            variable_name,
+            DimensionSelection(
+                time=time_name,
+                latitude=latitude_name,
+                longitude=longitude_name,
+            ),
         )
 
     def _activate_capture_mode(self, capture_mode: str) -> None:
@@ -1118,10 +1191,7 @@ class InSARViewerDockWidget(QDockWidget):
                 latitude=sample_y,
             )
             self.reference_points.append(point)
-            self._refresh_point_lists()
-            self._refresh_canvas_markers()
-            self._refresh_value_range_from_data()
-            self._refresh_point_plot()
+            self._handle_reference_points_change()
         elif self.current_capture_mode == "series":
             point = SamplePoint(
                 label=f"SER-{len(self.series_points) + 1}",
@@ -1199,10 +1269,7 @@ class InSARViewerDockWidget(QDockWidget):
             if not self.reference_points:
                 return
             self.reference_points.pop()
-            self._refresh_point_lists()
-            self._refresh_canvas_markers()
-            self._refresh_value_range_from_data()
-            self._refresh_point_plot()
+            self._handle_reference_points_change()
             return
 
         if point_role == "series":
@@ -1220,10 +1287,7 @@ class InSARViewerDockWidget(QDockWidget):
 
         if point_role == "reference":
             self.reference_points.clear()
-            self._refresh_point_lists()
-            self._refresh_canvas_markers()
-            self._refresh_value_range_from_data()
-            self._refresh_point_plot()
+            self._handle_reference_points_change()
             return
 
         if point_role == "series":
@@ -1659,10 +1723,29 @@ class InSARViewerDockWidget(QDockWidget):
 
         self.reset_map_tool()
         self.remove_preview_layer()
+        self._cancel_dataset_inspection_task()
+        self._cancel_dataset_load_task()
         self._cancel_live_probe_task()
         self.live_probe_point = None
         self.pending_live_probe_point = None
         self.overlay_manager.clear_all()
+
+    def _cancel_dataset_inspection_task(self) -> None:
+        """Cancel the active dataset inspection task when present."""
+
+        if self.dataset_inspection_task is None:
+            return
+        self.dataset_inspection_task.cancel()
+        self.dataset_inspection_task = None
+
+    def _cancel_dataset_load_task(self) -> None:
+        """Cancel the active dataset load task when present."""
+
+        if self.dataset_load_task is None:
+            return
+        self.dataset_load_task.cancel()
+        self.dataset_load_task = None
+        self._current_dataset_load_request = None
 
     def _show_error_message(self, title: str, message: str) -> None:
         """Show an error dialog."""

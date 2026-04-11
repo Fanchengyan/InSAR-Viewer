@@ -2,18 +2,155 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PyQt5.QtCore import pyqtSignal
 from qgis.core import QgsTask
 
+from .data_loader import InSARDataset, inspect_dataset
 from .logging import setup_logger
-from .models import LiveProbePlotResult, SamplePoint, SampleSeries
+from .models import (
+    DatasetInspection,
+    DimensionSelection,
+    LiveProbePlotResult,
+    SamplePoint,
+    SampleSeries,
+)
 
 if TYPE_CHECKING:
-    from .data_loader import InSARDataset
+    pass
 
 logger = setup_logger(__name__)
+
+
+class DatasetInspectionTask(QgsTask):
+    """Inspect a source dataset in a QGIS background task."""
+
+    inspectionFinished = pyqtSignal(bool, object, object, str)
+
+    def __init__(self, dataset_path: Path) -> None:
+        """Initialize the dataset inspection task.
+
+        Parameters
+        ----------
+        dataset_path : Path
+            Source dataset path to inspect.
+        """
+
+        super().__init__("Inspect InSAR dataset", QgsTask.CanCancel)
+        self.dataset_path = dataset_path
+        self.inspection: DatasetInspection | None = None
+        self.error_message = ""
+
+    def run(self) -> bool:
+        """Inspect the dataset without blocking the UI thread.
+
+        Returns
+        -------
+        bool
+            ``True`` when inspection succeeds, otherwise ``False``.
+        """
+
+        if self.isCanceled():
+            self.error_message = "Dataset inspection was canceled."
+            return False
+
+        try:
+            self.inspection = inspect_dataset(self.dataset_path)
+        except Exception as exc:
+            logger.error(
+                "Dataset inspection failed for %s in background task: %s",
+                self.dataset_path,
+                exc,
+            )
+            self.error_message = str(exc)
+            return False
+        return not self.isCanceled()
+
+    def finished(self, result: bool) -> None:
+        """Emit inspection results on the main thread."""
+
+        self.inspectionFinished.emit(
+            result,
+            self.dataset_path,
+            self.inspection,
+            self.error_message,
+        )
+
+
+class DatasetLoadTask(QgsTask):
+    """Load the selected InSAR variable in a QGIS background task."""
+
+    datasetLoaded = pyqtSignal(bool, object, str, object, object, str)
+
+    def __init__(
+        self,
+        dataset_path: Path,
+        variable_name: str,
+        dimensions: DimensionSelection,
+    ) -> None:
+        """Initialize the dataset load task.
+
+        Parameters
+        ----------
+        dataset_path : Path
+            Source dataset path.
+        variable_name : str
+            Selected variable name.
+        dimensions : DimensionSelection
+            User-selected dimension mapping.
+        """
+
+        super().__init__("Load InSAR dataset", QgsTask.CanCancel)
+        self.dataset_path = dataset_path
+        self.variable_name = variable_name
+        self.dimensions = dimensions
+        self.dataset: InSARDataset | None = None
+        self.error_message = ""
+
+    def run(self) -> bool:
+        """Load the dataset without blocking the UI thread.
+
+        Returns
+        -------
+        bool
+            ``True`` when loading succeeds, otherwise ``False``.
+        """
+
+        if self.isCanceled():
+            self.error_message = "Dataset loading was canceled."
+            return False
+
+        try:
+            self.dataset = InSARDataset.load(
+                self.dataset_path,
+                variable_name=self.variable_name,
+                dimensions=self.dimensions,
+            )
+        except Exception as exc:
+            logger.error(
+                "Dataset load failed for %s (%s, %s) in background task: %s",
+                self.dataset_path,
+                self.variable_name,
+                self.dimensions,
+                exc,
+            )
+            self.error_message = str(exc)
+            return False
+        return not self.isCanceled()
+
+    def finished(self, result: bool) -> None:
+        """Emit dataset load results on the main thread."""
+
+        self.datasetLoaded.emit(
+            result,
+            self.dataset_path,
+            self.variable_name,
+            self.dimensions,
+            self.dataset,
+            self.error_message,
+        )
 
 
 class LiveProbePlotTask(QgsTask):
