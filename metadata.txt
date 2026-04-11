@@ -1,0 +1,17 @@
+[general]
+name=InSAR Viewer
+qgisMinimumVersion=3.28
+description=Load InSAR time-series datasets, select reference points, preview slices, and export results.
+version=0.1.0
+author=Codex
+email=
+about=InSAR Viewer is a QGIS plugin for loading NetCDF/HDF5 InSAR datasets, adjusting them against reference points, visualizing spatial slices and temporal profiles, and exporting processed outputs.
+category=Raster
+icon=assets/insar_viewer_icon.svg
+hasProcessingProvider=no
+experimental=True
+deprecated=False
+tags=insar,netcdf,hdf5,xarray,timeseries,raster
+homepage=
+tracker=
+repository=

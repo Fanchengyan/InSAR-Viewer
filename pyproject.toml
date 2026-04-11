@@ -1,0 +1,45 @@
+[project]
+name = "insar-viewer"
+version = "0.1.0"
+description = "QGIS plugin for inspecting and exporting InSAR time-series datasets"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "dask[array]>=2024.1.0",
+    "h5netcdf>=1.4.0",
+    "matplotlib>=3.8.0",
+    "numpy>=1.26.0",
+    "openpyxl>=3.1.0",
+    "pandas>=2.2.0",
+    "rasterio>=1.4.0",
+    "rioxarray>=0.15.0,<0.18.0",
+    "xarray>=2024.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.11.0",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+# [tool.pixi.workspace]
+# channels = ["conda-forge"]
+# platforms = ["osx-arm64"]
+
+# [tool.pixi.pypi-dependencies]
+# insar-viewer = { path = ".", editable = true }
+
+# [tool.pixi.tasks]
+# qgis = { cmd = "sh -lc 'QCA_PLUGIN_PATH=\"$CONDA_PREFIX/plugins/crypto\" DYLD_FRAMEWORK_PATH=\"$CONDA_PREFIX/lib\" DYLD_LIBRARY_PATH=\"$CONDA_PREFIX/lib\" qgis'" }
+
+# [tool.pixi.dependencies]
+# qgis = ">=3.40.3,<4"
+# qca = ">=2.3.10,<3"
+# openssl = ">=3.6.2,<4"
+# rasterio = ">=1.4.3,<2"
