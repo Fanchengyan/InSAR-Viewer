@@ -101,9 +101,7 @@ class InSARViewerDockWidget(QDockWidget):
         self.iface = iface
         self.setMinimumSize(360, 520)
         ui_path = (
-            Path(__file__).resolve().parents[1]
-            / "ui"
-            / "insar_viewer_dock_widget.ui"
+            Path(__file__).resolve().parents[1] / "ui" / "insar_viewer_dock_widget.ui"
         )
         uic.loadUi(str(ui_path), self)
         self._bind_ui_widgets()
@@ -122,11 +120,14 @@ class InSARViewerDockWidget(QDockWidget):
         self.pending_live_probe_point: SamplePoint | None = None
         self.dataset_inspection_task: DatasetInspectionTask | None = None
         self.dataset_load_task: DatasetLoadTask | None = None
-        self._current_dataset_load_request: tuple[
-            Path,
-            str,
-            DimensionSelection,
-        ] | None = None
+        self._current_dataset_load_request: (
+            tuple[
+                Path,
+                str,
+                DimensionSelection,
+            ]
+            | None
+        ) = None
         self.dependency_install_task: DependencyInstallTask | None = None
         self._is_updating_ui = False
 
@@ -233,8 +234,7 @@ class InSARViewerDockWidget(QDockWidget):
                 ", ".join(missing_names),
             )
             raise RuntimeError(
-                "The UI file is missing required widgets: "
-                + ", ".join(missing_names)
+                "The UI file is missing required widgets: " + ", ".join(missing_names)
             )
 
         self.selectionGroupBox = self._find_widget_with_fallback(
@@ -345,7 +345,9 @@ class InSARViewerDockWidget(QDockWidget):
 
         self.loadSourceButton.clicked.connect(self._load_source_dataset)
         self.variableComboBox.currentTextChanged.connect(self._handle_variable_change)
-        self.timeDimensionComboBox.currentTextChanged.connect(self._apply_dataset_selection)
+        self.timeDimensionComboBox.currentTextChanged.connect(
+            self._apply_dataset_selection
+        )
         self.latitudeDimensionComboBox.currentTextChanged.connect(
             self._apply_dataset_selection
         )
@@ -380,8 +382,12 @@ class InSARViewerDockWidget(QDockWidget):
         self.renderModeComboBox.currentIndexChanged.connect(
             self._handle_render_style_change
         )
-        self.minValueDoubleSpinBox.valueChanged.connect(self._handle_render_range_change)
-        self.maxValueDoubleSpinBox.valueChanged.connect(self._handle_render_range_change)
+        self.minValueDoubleSpinBox.valueChanged.connect(
+            self._handle_render_range_change
+        )
+        self.maxValueDoubleSpinBox.valueChanged.connect(
+            self._handle_render_range_change
+        )
         self.autoValueRangeCheckBox.toggled.connect(
             self._handle_auto_value_range_toggle
         )
@@ -428,12 +434,18 @@ class InSARViewerDockWidget(QDockWidget):
         self.seriesColorButton.clicked.connect(
             lambda: self._choose_point_color("series")
         )
-        self.pointPlotStartComboBox.currentIndexChanged.connect(self._refresh_point_plot)
+        self.pointPlotStartComboBox.currentIndexChanged.connect(
+            self._refresh_point_plot
+        )
         self.pointPlotEndComboBox.currentIndexChanged.connect(self._refresh_point_plot)
         self.liveSeriesProbeCheckBox.toggled.connect(self._handle_live_probe_toggle)
         self.exportPointSeriesCsvButton.clicked.connect(self._export_series_points)
-        self.refreshDependenciesButton.clicked.connect(self._refresh_dependency_statuses)
-        self.installDependenciesButton.clicked.connect(self._install_missing_dependencies)
+        self.refreshDependenciesButton.clicked.connect(
+            self._refresh_dependency_statuses
+        )
+        self.installDependenciesButton.clicked.connect(
+            self._install_missing_dependencies
+        )
 
     def _set_selection_controls_enabled(self, enabled: bool) -> None:
         """Enable or disable dataset-selection controls."""
@@ -683,16 +695,47 @@ class InSARViewerDockWidget(QDockWidget):
         if request == self._current_dataset_load_request:
             return
 
-        self._cancel_dataset_load_task()
         self._current_dataset_load_request = request
-        task = DatasetLoadTask(
+        self._load_dataset_sync(
             dataset_path=self.dataset_path,
             variable_name=variable_name,
             dimensions=dimensions,
         )
-        task.datasetLoaded.connect(self._handle_dataset_load_finished)
-        self.dataset_load_task = task
-        QgsApplication.taskManager().addTask(task)
+
+    def _load_dataset_sync(
+        self,
+        dataset_path: Path,
+        variable_name: str,
+        dimensions: DimensionSelection,
+    ) -> None:
+        """Load the dataset synchronously in the main process."""
+
+        error_message = ""
+        try:
+            dataset = InSARDataset.load(
+                dataset_path,
+                variable_name=variable_name,
+                dimensions=dimensions,
+            )
+        except Exception as exc:
+            logger.error(
+                "Dataset load failed for %s (%s, %s): %s",
+                dataset_path,
+                variable_name,
+                dimensions,
+                exc,
+            )
+            error_message = str(exc)
+            dataset = None
+
+        self._handle_dataset_load_finished(
+            success=dataset is not None,
+            dataset_path=dataset_path,
+            variable_name=variable_name,
+            dimensions=dimensions,
+            dataset=dataset,
+            error_message=error_message,
+        )
 
     def _handle_dataset_load_finished(
         self,
@@ -711,7 +754,6 @@ class InSARViewerDockWidget(QDockWidget):
             dimensions,
         )
         if request == self._current_dataset_load_request:
-            self.dataset_load_task = None
             self._current_dataset_load_request = None
 
         if not isinstance(dataset_path, Path) or not isinstance(
