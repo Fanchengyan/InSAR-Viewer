@@ -6,6 +6,7 @@ import math
 from typing import Any, TypedDict
 
 from PyQt5.QtCore import QEvent, QPoint, QPointF, Qt
+from PyQt5.QtGui import QPainter
 from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 from .logging import setup_logger
@@ -120,6 +121,11 @@ class TimeSeriesPlotWidget(QWidget):
 
         plot_widget = plot_widget_class(self)
         plot_widget.setBackground("w")
+        plot_widget.setRenderHints(
+            QPainter.Antialiasing
+            | QPainter.TextAntialiasing
+            | QPainter.SmoothPixmapTransform
+        )
         plot_widget.showGrid(x=True, y=True, alpha=0.3)
         plot_widget.setLabel("left", "Value")
         plot_widget.setLabel("bottom", "Time")
@@ -374,6 +380,7 @@ class TimeSeriesPlotWidget(QWidget):
                 pg.PlotDataItem(
                     x_values,
                     y_values,
+                    antialias=True,
                     pen=pg.mkPen(color, width=2),
                     name=series.point.label,
                 )
