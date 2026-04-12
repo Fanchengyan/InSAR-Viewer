@@ -20,15 +20,6 @@
 - **Commits**: Conventional Commits (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`)
 - **Linter**: ruff only (no black, no flake8). Line length 88. Ruff excludes `tests/`, `docs/`, `examples/` directories.
 
-## Build, Test, and Development Commands
-
-- `uv run ruff check tools ui *.py`: lint Python sources.
-- `uv run python -m py_compile tools/*.py ui/*.py geo_sam_tool.py geo_sam_provider.py`: quick syntax validation.
-- `cd docs && make html`: build the Sphinx documentation into `docs/build/html`.
-- `python -m pip install rasterio geopandas pyarrow ultralytics`: install runtime dependencies into the QGIS Python environment when needed.
-
-Run commands from the plugin root unless noted otherwise.
-
 ## Coding Style & Naming Conventions
 
 Use Python3.9+, 4-space indentation, Python 3.11+ type hints, and NumPy-style docstrings. Write code, comments, and log messages in English. Prefer descriptive `snake_case` for functions and variables, `PascalCase` for Qt/QGIS widget classes, and `UPPER_CASE` for constants. Use `Literal`, `TypedDict`, `Protocol`, and `Self` where they clarify the API. Format and lint with `ruff`; use `uv` for Python tooling.
@@ -48,7 +39,3 @@ When adding tests later, place them in a top-level `tests/` package and name fil
 Recent commits use short, imperative prefixes such as `fix:`, `refactor:`, `update`, and `remove:`. Follow that style and keep subjects concise, for example `fix: preserve feature-cache model fallback`.
 
 PRs should include a clear summary, affected QGIS workflows, manual test steps, and screenshots or GIFs for UI changes. Link related issues when relevant.
-
-## Configuration & Safety Notes
-
-Do not commit machine-specific paths in `ui/config/user.json`. Keep defaults portable, and log context before raising errors in runtime code.
