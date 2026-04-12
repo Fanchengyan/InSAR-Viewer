@@ -15,7 +15,14 @@ from PyQt5.QtCore import pyqtSignal
 from qgis.core import QgsTask
 
 from .logging import setup_logger
+from .runtime_environment import (
+    configure_native_data_paths,
+    is_module_origin_in_active_prefix,
+    module_spec_origin_path,
+    prefer_active_prefix_imports,
+)
 
+configure_native_data_paths()
 logger = setup_logger(__name__)
 
 
@@ -87,6 +94,16 @@ REQUIRED_DEPENDENCIES: tuple[DependencySpec, ...] = (
         pip_spec="rasterio>=1.4.0",
     ),
     DependencySpec(
+        package_name="pyproj",
+        import_name="pyproj",
+        pip_spec="pyproj>=3.6.1",
+    ),
+    DependencySpec(
+        package_name="cftime",
+        import_name="cftime",
+        pip_spec="cftime>=1.6.4",
+    ),
+    DependencySpec(
         package_name="pandas",
         import_name="pandas",
         pip_spec="pandas>=2.2.0",
@@ -120,16 +137,24 @@ def dependency_statuses() -> list[DependencyStatus]:
     """
 
     statuses: list[DependencyStatus] = []
-    for dependency in REQUIRED_DEPENDENCIES:
-        installed = importlib.util.find_spec(dependency.import_name) is not None
-        version = _distribution_version(dependency.package_name) if installed else None
-        statuses.append(
-            DependencyStatus(
-                dependency=dependency,
-                installed=installed,
-                version=version,
+    with prefer_active_prefix_imports(
+        ("pyproj", "rasterio", "rioxarray", "xarray", "cftime")
+    ):
+        for dependency in REQUIRED_DEPENDENCIES:
+            module_origin = module_spec_origin_path(dependency.import_name)
+            installed = module_origin is not None
+            if installed and dependency.import_name in {"pyproj", "rasterio"}:
+                installed = is_module_origin_in_active_prefix(module_origin)
+            version = (
+                _distribution_version(dependency.package_name) if installed else None
             )
-        )
+            statuses.append(
+                DependencyStatus(
+                    dependency=dependency,
+                    installed=installed,
+                    version=version,
+                )
+            )
     return statuses
 
 

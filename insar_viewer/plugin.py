@@ -10,6 +10,9 @@ from PyQt5.QtWidgets import QAction
 
 from .dock_widget import InSARViewerDockWidget
 from .logging import setup_logger
+from .runtime_environment import configure_native_data_paths
+
+configure_native_data_paths()
 
 logger = setup_logger(__name__)
 

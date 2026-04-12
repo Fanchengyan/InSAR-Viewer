@@ -16,10 +16,16 @@ from .constants import (
 )
 from .logging import setup_logger
 from .models import DatasetInspection, DimensionSelection, SamplePoint, SampleSeries
+from .runtime_environment import (
+    configure_native_data_paths,
+    ensure_module_origin_in_active_prefix,
+    prefer_active_prefix_imports,
+)
 
 if TYPE_CHECKING:
     import xarray as xr
 
+configure_native_data_paths()
 logger = setup_logger(__name__)
 
 
@@ -38,7 +44,8 @@ def _import_xarray() -> Any:
     """
 
     try:
-        import xarray as xr
+        with prefer_active_prefix_imports(("xarray", "cftime")):
+            import xarray as xr
     except ImportError as exc:
         logger.error("xarray is required to load InSAR datasets: %s", exc)
         raise RuntimeError("xarray is required to load InSAR datasets.") from exc
@@ -60,10 +67,17 @@ def _import_rioxarray() -> Any:
     """
 
     try:
-        import rioxarray
+        with prefer_active_prefix_imports(
+            ("pyproj", "rasterio", "rioxarray", "xarray", "cftime")
+        ):
+            import pyproj
+            import rasterio
+            import rioxarray
     except ImportError as exc:
         logger.error("rioxarray is required to load raster datasets: %s", exc)
         raise RuntimeError("rioxarray is required to load raster datasets.") from exc
+    ensure_module_origin_in_active_prefix("pyproj", pyproj)
+    ensure_module_origin_in_active_prefix("rasterio", rasterio)
     return rioxarray
 
 
@@ -114,16 +128,62 @@ def _open_source_dataset(
     try:
         return rioxarray.open_rasterio(dataset_path, **open_kwargs)
     except Exception as exc:
+        if _should_retry_without_time_decoding(exc):
+            logger.warning(
+                "Failed to decode temporal metadata for %s with rioxarray: %s. "
+                "Retrying with decode_times=False.",
+                dataset_path,
+                exc,
+            )
+            retry_kwargs = dict(open_kwargs)
+            retry_kwargs["decode_times"] = False
+            try:
+                return rioxarray.open_rasterio(dataset_path, **retry_kwargs)
+            except Exception as retry_exc:
+                logger.error(
+                    "Failed to open dataset %s with rioxarray.open_rasterio after "
+                    "disabling time decoding: %s",
+                    dataset_path,
+                    retry_exc,
+                )
+                raise RuntimeError(
+                    "Unable to open the dataset with rioxarray.open_rasterio after "
+                    f"retrying with decode_times=False: {retry_exc}"
+                ) from retry_exc
         logger.error(
             "Failed to open dataset %s with rioxarray.open_rasterio: %s",
             dataset_path,
             exc,
         )
         raise RuntimeError(
-            "Unable to open the dataset with rioxarray.open_rasterio. Ensure "
-            "rioxarray, rasterio, and dask are installed in the QGIS Python "
-            "environment."
+            "Unable to open the dataset with rioxarray.open_rasterio: "
+            f"{exc}. Ensure the required runtime dependencies are installed in "
+            "the QGIS Python environment."
         ) from exc
+
+
+def _should_retry_without_time_decoding(error: Exception) -> bool:
+    """Return whether opening should be retried with ``decode_times=False``.
+
+    Parameters
+    ----------
+    error : Exception
+        Exception raised while opening the dataset with rioxarray.
+
+    Returns
+    -------
+    bool
+        ``True`` when the failure indicates CF time decoding is unsupported in
+        the active environment.
+    """
+
+    error_text = str(error)
+    lowered_error_text = error_text.casefold()
+    return (
+        "unable to decode time units" in lowered_error_text
+        or "cftime package is required" in lowered_error_text
+        or "non-standard calendars" in lowered_error_text
+    )
 
 
 def _detect_dimension_name(
@@ -376,7 +436,7 @@ class InSARDataset:
 
     @staticmethod
     def _detect_crs_metadata(data_array: xr.DataArray) -> tuple[str | None, bool]:
-        """Detect CRS metadata from the rioxarray accessor.
+        """Detect CRS metadata without invoking external CRS parsers.
 
         Parameters
         ----------
@@ -391,17 +451,9 @@ class InSARDataset:
             expose CRS information.
         """
 
-        try:
-            rio_crs = data_array.rio.crs
-        except Exception as exc:
-            logger.warning("Failed to read CRS from rioxarray accessor: %s", exc)
-            rio_crs = None
-        if rio_crs is not None:
-            crs_wkt = rio_crs.to_wkt() if hasattr(rio_crs, "to_wkt") else str(rio_crs)
-            is_geographic = bool(
-                rio_crs.is_geographic if hasattr(rio_crs, "is_geographic") else False
-            )
-            return crs_wkt, is_geographic
+        crs_wkt = _extract_crs_string_from_data_array(data_array)
+        if crs_wkt is not None:
+            return crs_wkt, _is_geographic_crs_string(crs_wkt)
 
         logger.warning("No CRS metadata was found in the loaded dataset.")
         return None, False
@@ -631,3 +683,58 @@ class InSARDataset:
                 )
             )
         return sampled_series
+
+
+def _extract_crs_string_from_data_array(data_array: Any) -> str | None:
+    """Extract a CRS string from xarray metadata when available.
+
+    Parameters
+    ----------
+    data_array : Any
+        Data array returned by the loader.
+
+    Returns
+    -------
+    str | None
+        CRS string from known metadata locations, or ``None`` when absent.
+    """
+
+    spatial_ref = data_array.coords.get("spatial_ref")
+    if spatial_ref is not None:
+        spatial_ref_attributes = getattr(spatial_ref, "attrs", {})
+        for attribute_name in ("crs_wkt", "spatial_ref"):
+            attribute_value = spatial_ref_attributes.get(attribute_name)
+            if isinstance(attribute_value, str) and attribute_value.strip():
+                return attribute_value.strip()
+
+    for attribute_name in ("crs_wkt", "spatial_ref", "crs"):
+        attribute_value = data_array.attrs.get(attribute_name)
+        if isinstance(attribute_value, str) and attribute_value.strip():
+            return attribute_value.strip()
+
+    return None
+
+
+def _is_geographic_crs_string(crs_string: str) -> bool:
+    """Return whether a CRS string appears to describe a geographic CRS.
+
+    Parameters
+    ----------
+    crs_string : str
+        CRS authority string or WKT text.
+
+    Returns
+    -------
+    bool
+        ``True`` when the CRS string looks geographic.
+    """
+
+    normalized_crs = crs_string.casefold()
+    geographic_tokens = (
+        "epsg:4326",
+        'authority["epsg","4326"]',
+        "geogcs[",
+        "geodcrs[",
+        "latitude_longitude",
+    )
+    return any(token in normalized_crs for token in geographic_tokens)
