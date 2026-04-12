@@ -114,14 +114,9 @@ REQUIRED_DEPENDENCIES: tuple[DependencySpec, ...] = (
         pip_spec="openpyxl>=3.1.0",
     ),
     DependencySpec(
-        package_name="matplotlib",
-        import_name="matplotlib",
-        pip_spec="matplotlib>=3.8.0,<3.11.0",
-    ),
-    DependencySpec(
-        package_name="h5netcdf",
-        import_name="h5netcdf",
-        pip_spec="h5netcdf>=1.4.0",
+        package_name="pyqtgraph",
+        import_name="pyqtgraph",
+        pip_spec="pyqtgraph>=0.13.0",
         required=False,
     ),
 )

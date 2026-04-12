@@ -7,11 +7,10 @@ requires-python = ">=3.9"
 dependencies = [
     "cftime>=1.6.4",
     "dask[array]>=2024.1.0",
-    "h5netcdf>=1.4.0",
-    "matplotlib>=3.8.0",
     "numpy>=1.26.0",
     "openpyxl>=3.1.0",
     "pandas>=2.2.0",
+    "pyqtgraph>=0.13.0",
     "pyproj>=3.6.1",
     "rasterio>=1.4.0",
     "rioxarray>=0.15.0,<0.18.0",
