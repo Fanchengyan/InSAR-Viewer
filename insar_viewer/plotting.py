@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Callable
+from typing import Any, TypedDict
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QEvent, QPoint, QPointF, Qt
 from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 from .logging import setup_logger
@@ -14,6 +14,18 @@ from .models import SampleSeries
 logger = setup_logger(__name__)
 
 pg: Any = None
+
+
+class HoverPointInfo(TypedDict):
+    """Metadata shown inside the time-series hover tooltip."""
+
+    label: str
+    time: str
+    value: float
+    requested_lon: float
+    requested_lat: float
+    matched_lon: float
+    matched_lat: float
 
 
 def _import_pyqtgraph() -> type[Any]:
@@ -59,10 +71,11 @@ class HoverLabel(QLabel):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setTextFormat(Qt.PlainText)
         self.setStyleSheet(
-            "background-color: rgba(255, 255, 255, 220);"
-            "border: 1px solid #888;"
-            "padding: 4px;"
-            "border-radius: 3px;"
+            "background-color: rgba(255, 255, 255, 235);"
+            "border: 1px solid #6b7280;"
+            "color: #111827;"
+            "padding: 6px 8px;"
+            "border-radius: 4px;"
         )
 
 
@@ -112,6 +125,7 @@ class TimeSeriesPlotWidget(QWidget):
         plot_widget.setLabel("bottom", "Time")
         plot_widget.setTitle(self._title)
         plot_widget.addLegend()
+        plot_widget.setMouseEnabled(x=True, y=True)
         self._plot_widget = plot_widget
         self._layout.addWidget(plot_widget)
 
@@ -132,76 +146,139 @@ class TimeSeriesPlotWidget(QWidget):
         if self._plot_widget is None or self._hover_label is None:
             return
 
-        if hasattr(pos, "x"):
-            x_pos = pos.x()
-            y_pos = pos.y()
-        else:
+        if not hasattr(pos, "x") or not hasattr(pos, "y"):
             return
 
-        closest_info: dict[str, Any] | None = None
-        min_distance = float("inf")
-
-        for series_item in self._series_data:
-            x_values = series_item.get("x", [])
-            y_values = series_item.get("y", [])
-            point_data = series_item.get("point_data", [])
-
-            for i in range(len(x_values)):
-                distance = abs(x_values[i] - x_pos) + abs(y_values[i] - y_pos)
-                if distance < min_distance and distance < 0.5:
-                    min_distance = distance
-                    if i < len(point_data):
-                        closest_info = point_data[i]
+        closest_info = self._find_hover_point_info(QPointF(pos.x(), pos.y()))
 
         if closest_info is not None:
             self._show_hover_label(closest_info)
         else:
             self._hover_label.hide()
 
-    def _on_scatter_hovered(self, scatter_item: Any, spot: Any) -> None:
-        """Handle scatter plot item hover event.
+    def _find_hover_point_info(
+        self,
+        scene_position: QPointF,
+    ) -> HoverPointInfo | None:
+        """Return the hovered point nearest to the cursor.
 
         Parameters
         ----------
-        scatter_item : pg.ScatterPlotItem
-            The scatter plot item that triggered the event.
-        :param spot: The spot that is hovered.
+        scene_position : QPointF
+            Cursor position in scene coordinates.
+
+        Returns
+        -------
+        HoverPointInfo | None
+            Point metadata when the cursor is close enough to a plotted marker.
         """
 
-        if spot is None:
-            self._hover_label.hide()
-            return
+        if self._plot_widget is None:
+            return None
 
-        point_info = spot.data()
-        if point_info is not None:
-            self._show_hover_label(point_info)
-        else:
-            self._hover_label.hide()
+        scene_rect = self._plot_widget.sceneBoundingRect()
+        if not scene_rect.contains(scene_position):
+            return None
 
-    def _show_hover_label(self, closest_info: dict[str, Any]) -> None:
+        view_box = self._plot_widget.plotItem.vb
+        cursor_view_position = view_box.mapSceneToView(scene_position)
+        max_distance_pixels = 12.0
+        tolerance_view_position = view_box.mapSceneToView(
+            QPointF(
+                scene_position.x() + max_distance_pixels,
+                scene_position.y() + max_distance_pixels,
+            )
+        )
+        x_tolerance = max(
+            abs(tolerance_view_position.x() - cursor_view_position.x()),
+            1e-9,
+        )
+        y_tolerance = max(
+            abs(tolerance_view_position.y() - cursor_view_position.y()),
+            1e-9,
+        )
+
+        closest_info: HoverPointInfo | None = None
+        min_distance = float("inf")
+        for series_item in self._series_data:
+            x_values = series_item.get("x", [])
+            y_values = series_item.get("y", [])
+            point_data = series_item.get("point_data", [])
+
+            for index, (x_value, y_value) in enumerate(zip(x_values, y_values)):
+                if not math.isfinite(y_value) or index >= len(point_data):
+                    continue
+
+                normalized_distance = math.hypot(
+                    (x_value - cursor_view_position.x()) / x_tolerance,
+                    (y_value - cursor_view_position.y()) / y_tolerance,
+                )
+                if normalized_distance <= 1.0 and normalized_distance < min_distance:
+                    min_distance = normalized_distance
+                    closest_info = point_data[index]
+        return closest_info
+
+    def _show_hover_label(self, closest_info: HoverPointInfo) -> None:
         """Show the hover label with point information.
 
         Parameters
         ----------
-        closest_info : dict[str, Any]
+        closest_info : HoverPointInfo
             Information about the hovered point.
         """
 
+        time_val = closest_info.get("time", "")
+        if "T" in time_val:
+            time_val = time_val.split("T")[0]
+        elif " " in time_val:
+            time_val = time_val.split(" ")[0]
+        time_val = time_val[:10] if len(time_val) >= 10 else time_val
+
+        lon = closest_info.get("matched_lon", 0)
+        lat = closest_info.get("matched_lat", 0)
         text = (
             f"Point: {closest_info.get('label', '')}\n"
-            f"Time: {closest_info.get('time', '')}\n"
-            f"Value: {closest_info.get('value', 0):.6g}\n"
-            f"Requested Lon: {closest_info.get('requested_lon', 0):.6f}\n"
-            f"Requested Lat: {closest_info.get('requested_lat', 0):.6f}\n"
-            f"Matched Lon: {closest_info.get('matched_lon', 0):.6f}\n"
-            f"Matched Lat: {closest_info.get('matched_lat', 0):.6f}"
+            f"x: {time_val}\n"
+            f"y: {closest_info.get('value', 0):.6g}\n"
+            f"Location: ({lon:.4f}, {lat:.4f})"
         )
         self._hover_label.setText(text)
         self._hover_label.adjustSize()
 
-        cursor_pos = self.mapFromGlobal(self.cursor().pos())
-        self._hover_label.move(cursor_pos.x() + 15, cursor_pos.y() + 15)
+        cursor_global_pos = self.cursor().pos()
+        plot_top_left = self.mapToGlobal(self.rect().topLeft())
+        plot_bottom_right = self.mapToGlobal(self.rect().bottomRight())
+
+        min_x = plot_top_left.x() + 8
+        min_y = plot_top_left.y() + 8
+        max_x = max(
+            min_x,
+            plot_bottom_right.x() - self._hover_label.width() - 8,
+        )
+        max_y = max(
+            min_y,
+            plot_bottom_right.y() - self._hover_label.height() - 8,
+        )
+        label_position = QPoint(
+            min(max(cursor_global_pos.x() + 12, min_x), max_x),
+            min(max(cursor_global_pos.y() + 12, min_y), max_y),
+        )
+        self._hover_label.move(label_position)
         self._hover_label.show()
+        self._hover_label.raise_()
+
+    def leaveEvent(self, event: QEvent) -> None:
+        """Hide the hover label when the cursor leaves the plot widget.
+
+        Parameters
+        ----------
+        event : QEvent
+            Qt leave event.
+        """
+
+        if self._hover_label is not None:
+            self._hover_label.hide()
+        super().leaveEvent(event)
 
     def draw_time_series(
         self,
@@ -238,6 +315,8 @@ class TimeSeriesPlotWidget(QWidget):
 
         self._time_labels = time_labels
         self._series_data = []
+        if self._hover_label is not None:
+            self._hover_label.hide()
         self._plot_widget.clear()
 
         bounded_end_index = len(time_labels) - 1 if end_index is None else end_index
@@ -263,8 +342,8 @@ class TimeSeriesPlotWidget(QWidget):
                 else 8.0
             )
 
-            point_data = []
-            for i, idx in enumerate(visible_indices):
+            point_data: list[HoverPointInfo] = []
+            for idx in visible_indices:
                 point_data.append(
                     {
                         "label": series.point.label,
@@ -281,21 +360,14 @@ class TimeSeriesPlotWidget(QWidget):
                 {"x": x_values, "y": y_values, "point_data": point_data}
             )
 
-            spots = []
-            for i in range(len(x_values)):
-                spots.append(
-                    pg.ScatterPlotItem.Spot(
-                        x=x_values[i],
-                        y=y_values[i],
-                        size=marker_size,
-                        pen=color,
-                        brush=color,
-                        data=point_data[i],
-                    )
-                )
-
-            scatter = pg.ScatterPlotItem(spots=spots, pxMode=True)
-            scatter.sigHovered.connect(self._on_scatter_hovered)
+            scatter = pg.ScatterPlotItem(
+                x=x_values,
+                y=y_values,
+                size=marker_size,
+                pen=color,
+                brush=color,
+                pxMode=True,
+            )
             self._plot_widget.addItem(scatter)
 
             self._plot_widget.plotItem.addItem(
@@ -308,7 +380,7 @@ class TimeSeriesPlotWidget(QWidget):
             )
 
         tick_positions = self._tick_positions(visible_indices)
-        tick_labels = [time_labels[i] for i in tick_positions]
+        tick_labels = [self._format_time_label(time_labels[i]) for i in tick_positions]
         ax = self._plot_widget.getAxis("bottom")
         ax.setTicks([list(zip(tick_positions, tick_labels))])
 
@@ -333,6 +405,26 @@ class TimeSeriesPlotWidget(QWidget):
         g = int(color_hex[2:4], 16)
         b = int(color_hex[4:6], 16)
         return (r, g, b, 255)
+
+    def _format_time_label(self, label: str) -> str:
+        """Format time label to show only date (YYYY-MM-DD).
+
+        Parameters
+        ----------
+        label : str
+            Original time label.
+
+        Returns
+        -------
+        str
+            Formatted label with only date.
+        """
+
+        if "T" in label:
+            return label.split("T")[0]
+        if " " in label:
+            return label.split(" ")[0]
+        return label[:10] if len(label) >= 10 else label
 
     def _tick_positions(
         self,
