@@ -26,6 +26,7 @@ from qgis.core import (
     QgsApplication,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
+    QgsLayerTreeGroup,
     QgsPointXY,
     QgsProject,
     QgsRasterLayer,
@@ -75,6 +76,33 @@ logger = setup_logger(__name__)
 
 OPACITY_SLIDER_SCALE = 10
 DEFAULT_LAYER_OPACITY_PERCENT = 100.0
+DEFAULT_PREVIEW_LAYER_INSERT_INDEX = 0
+
+
+class PreviewLayerTreePosition:
+    """Persist the preview-layer position inside the QGIS layer tree.
+
+    Attributes
+    ----------
+    group_path : tuple[str, ...]
+        Hierarchical layer-group names from the root to the preview layer parent.
+    index : int
+        Zero-based insertion index inside the parent group.
+    """
+
+    def __init__(self, group_path: tuple[str, ...], index: int) -> None:
+        """Initialize the stored layer-tree position.
+
+        Parameters
+        ----------
+        group_path : tuple[str, ...]
+            Hierarchical layer-group names from the root to the parent group.
+        index : int
+            Zero-based insertion index inside the parent group.
+        """
+
+        self.group_path = group_path
+        self.index = index
 
 
 class InSARViewerDockWidget(QDockWidget):
@@ -110,6 +138,10 @@ class InSARViewerDockWidget(QDockWidget):
         self.dataset_inspection: DatasetInspection | None = None
         self.dataset: InSARDataset | None = None
         self.preview_layer_id: str | None = None
+        self.preview_layer_tree_position = PreviewLayerTreePosition(
+            group_path=(),
+            index=DEFAULT_PREVIEW_LAYER_INSERT_INDEX,
+        )
         self.preview_raster_path = Path(gettempdir()) / "insar_viewer_preview.tif"
         self.current_capture_mode: str | None = None
         self.reference_points: list[SamplePoint] = []
@@ -1099,6 +1131,9 @@ class InSARViewerDockWidget(QDockWidget):
         """Write the current date-view slice to a temporary raster layer."""
 
         project = QgsProject.instance()
+        previous_preview_position = self._preview_layer_tree_position()
+        if previous_preview_position is not None:
+            self.preview_layer_tree_position = previous_preview_position
         self.remove_preview_layer()
 
         clipped_values = self._clip_values_to_range(
@@ -1133,7 +1168,8 @@ class InSARViewerDockWidget(QDockWidget):
                 "The temporary preview raster could not be loaded in QGIS.",
             )
             return
-        project.addMapLayer(preview_layer)
+        project.addMapLayer(preview_layer, False)
+        self._insert_preview_layer_into_tree(preview_layer)
         self.preview_layer_id = preview_layer.id()
         self._apply_preview_renderer()
 
@@ -1694,6 +1730,54 @@ class InSARViewerDockWidget(QDockWidget):
         if self.preview_layer_id is None:
             return None
         return QgsProject.instance().mapLayer(self.preview_layer_id)
+
+    def _preview_layer_tree_position(self) -> PreviewLayerTreePosition | None:
+        """Return the current preview-layer position in the QGIS layer tree."""
+
+        if self.preview_layer_id is None:
+            return None
+
+        layer_tree_layer = QgsProject.instance().layerTreeRoot().findLayer(
+            self.preview_layer_id
+        )
+        if layer_tree_layer is None:
+            return None
+
+        parent_group = layer_tree_layer.parent()
+        if not isinstance(parent_group, QgsLayerTreeGroup):
+            return None
+
+        group_path: list[str] = []
+        current_group: QgsLayerTreeGroup | None = parent_group
+        root_group = QgsProject.instance().layerTreeRoot()
+        while current_group is not None and current_group is not root_group:
+            group_path.append(current_group.name())
+            parent_node = current_group.parent()
+            current_group = (
+                parent_node if isinstance(parent_node, QgsLayerTreeGroup) else None
+            )
+
+        return PreviewLayerTreePosition(
+            group_path=tuple(reversed(group_path)),
+            index=parent_group.children().index(layer_tree_layer),
+        )
+
+    def _insert_preview_layer_into_tree(self, preview_layer: QgsRasterLayer) -> None:
+        """Insert the preview layer back into its stored layer-tree position."""
+
+        root_group = QgsProject.instance().layerTreeRoot()
+        target_group = root_group
+        for group_name in self.preview_layer_tree_position.group_path:
+            next_group = target_group.findGroup(group_name)
+            if next_group is None:
+                break
+            target_group = next_group
+
+        target_index = min(
+            self.preview_layer_tree_position.index,
+            len(target_group.children()),
+        )
+        target_group.insertLayer(target_index, preview_layer)
 
     def _dataset_crs_label(self) -> str:
         """Return a short label for the active dataset CRS."""
