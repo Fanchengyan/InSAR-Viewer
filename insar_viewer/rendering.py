@@ -6,6 +6,7 @@ from typing import Literal
 
 import numpy as np
 from qgis.core import (
+    QgsColorRamp,
     QgsColorRampShader,
     QgsRasterShader,
     QgsSingleBandPseudoColorRenderer,
@@ -31,11 +32,12 @@ def list_qgis_color_ramps() -> list[str]:
 
 def apply_color_ramp_renderer(
     layer: object,
-    ramp_name: str,
+    ramp_name: str | None,
     minimum_value: float,
     maximum_value: float,
     render_mode: RenderMode,
     opacity: float = 1.0,
+    color_ramp: QgsColorRamp | None = None,
 ) -> None:
     """Apply a pseudo-color renderer to a raster layer.
 
@@ -43,8 +45,8 @@ def apply_color_ramp_renderer(
     ----------
     layer : object
         Raster layer instance.
-    ramp_name : str
-        QGIS color-ramp name.
+    ramp_name : str | None
+        QGIS color-ramp name. Used when ``color_ramp`` is not provided.
     minimum_value : float
         Lower render bound.
     maximum_value : float
@@ -53,6 +55,9 @@ def apply_color_ramp_renderer(
         Continuous or segmented ramp mode.
     opacity : float, optional
         Layer opacity in the range [0.0, 1.0].
+    color_ramp : QgsColorRamp | None, optional
+        Explicit QGIS color-ramp instance. When provided, it takes precedence over
+        ``ramp_name``.
     """
 
     if maximum_value <= minimum_value:
@@ -60,8 +65,10 @@ def apply_color_ramp_renderer(
     opacity = min(max(opacity, 0.0), 1.0)
 
     style = QgsStyle.defaultStyle()
-    color_ramp = style.colorRamp(ramp_name)
-    if color_ramp is None:
+    resolved_color_ramp = color_ramp
+    if resolved_color_ramp is None and ramp_name:
+        resolved_color_ramp = style.colorRamp(ramp_name)
+    if resolved_color_ramp is None:
         available_names = list_qgis_color_ramps()
         fallback_name = available_names[0]
         logger.warning(
@@ -69,8 +76,8 @@ def apply_color_ramp_renderer(
             ramp_name,
             fallback_name,
         )
-        color_ramp = style.colorRamp(fallback_name)
-    if color_ramp is None:
+        resolved_color_ramp = style.colorRamp(fallback_name)
+    if resolved_color_ramp is None:
         logger.error("No QGIS color ramp is available for raster rendering.")
         raise RuntimeError("No QGIS color ramp is available.")
 
@@ -78,7 +85,7 @@ def apply_color_ramp_renderer(
     items = [
         QgsColorRampShader.ColorRampItem(
             minimum_value + fraction * (maximum_value - minimum_value),
-            color_ramp.color(fraction),
+            resolved_color_ramp.color(fraction),
             f"{minimum_value + fraction * (maximum_value - minimum_value):.3f}",
         )
         for fraction in fractions

@@ -24,14 +24,21 @@ from PyQt5.QtWidgets import (
 )
 from qgis.core import (
     QgsApplication,
+    QgsColorRamp,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsLayerTreeGroup,
     QgsPointXY,
     QgsProject,
     QgsRasterLayer,
+    QgsStyle,
 )
 from qgis.gui import QgsFileWidget
+
+try:
+    from qgis.gui import QgsColorRampButton
+except ImportError:  # pragma: no cover - depends on QGIS runtime version
+    QgsColorRampButton = None
 
 from .canvas_items import PointOverlayManager
 from .constants import (
@@ -139,6 +146,8 @@ class InSARViewerDockWidget(QDockWidget):
         )
         uic.loadUi(str(ui_path), self)
         self._bind_ui_widgets()
+        self.colorRampButton: QgsColorRampButton | None = None
+        self._install_color_ramp_button_if_available()
 
         self.dataset_path: Path | None = None
         self.dataset_inspection: DatasetInspection | None = None
@@ -345,13 +354,16 @@ class InSARViewerDockWidget(QDockWidget):
         render_mode_index = self.renderModeComboBox.findData(DEFAULT_RENDER_MODE)
         self.renderModeComboBox.setCurrentIndex(render_mode_index)
 
-        self.colorRampComboBox.addItems(list_qgis_color_ramps())
         preferred_ramps = ("Viridis", "Turbo", "Spectral", "Magma")
-        for ramp_name in preferred_ramps:
-            ramp_index = self.colorRampComboBox.findText(ramp_name)
-            if ramp_index >= 0:
-                self.colorRampComboBox.setCurrentIndex(ramp_index)
-                break
+        if self.colorRampButton is not None:
+            self._set_preferred_color_ramp(preferred_ramps)
+        else:
+            self.colorRampComboBox.addItems(list_qgis_color_ramps())
+            for ramp_name in preferred_ramps:
+                ramp_index = self.colorRampComboBox.findText(ramp_name)
+                if ramp_index >= 0:
+                    self.colorRampComboBox.setCurrentIndex(ramp_index)
+                    break
 
         for combo_box in (
             self.referenceDateComboBox,
@@ -429,9 +441,14 @@ class InSARViewerDockWidget(QDockWidget):
         self.jumpToLastDateButton.clicked.connect(
             lambda: self._set_display_date_slider_position("last")
         )
-        self.colorRampComboBox.currentTextChanged.connect(
-            self._handle_render_style_change
-        )
+        if self.colorRampButton is not None:
+            self.colorRampButton.colorRampChanged.connect(
+                self._handle_render_style_change
+            )
+        else:
+            self.colorRampComboBox.currentTextChanged.connect(
+                self._handle_render_style_change
+            )
         self.renderModeComboBox.currentIndexChanged.connect(
             self._handle_render_style_change
         )
@@ -1224,7 +1241,7 @@ class InSARViewerDockWidget(QDockWidget):
         finally:
             self.displayDateSlider.blockSignals(False)
 
-    def _handle_render_style_change(self) -> None:
+    def _handle_render_style_change(self, *_args: object) -> None:
         """Handle color-ramp and render-mode changes."""
 
         if self._is_updating_ui:
@@ -1421,6 +1438,67 @@ class InSARViewerDockWidget(QDockWidget):
         self.preview_layer_id = preview_layer.id()
         self._apply_preview_renderer()
 
+    def _install_color_ramp_button_if_available(self) -> None:
+        """Replace the plain ramp combo box with the native QGIS ramp picker."""
+
+        if QgsColorRampButton is None:
+            return
+        parent_widget = self.colorRampComboBox.parentWidget()
+        if parent_widget is None:
+            logger.warning(
+                "Color ramp combo box has no parent widget. Falling back to text list."
+            )
+            return
+        parent_layout = parent_widget.layout()
+        if parent_layout is None:
+            logger.warning(
+                "Color ramp combo box parent has no layout. Falling back to text list."
+            )
+            return
+
+        color_ramp_button = QgsColorRampButton(parent_widget)
+        color_ramp_button.setObjectName("colorRampButton")
+        color_ramp_button.setSizePolicy(self.colorRampComboBox.sizePolicy())
+        if hasattr(color_ramp_button, "setShowNull"):
+            color_ramp_button.setShowNull(False)
+        if hasattr(color_ramp_button, "setDialogTitle"):
+            color_ramp_button.setDialogTitle("Select Color Ramp")
+
+        parent_layout.replaceWidget(self.colorRampComboBox, color_ramp_button)
+        self.colorRampComboBox.hide()
+        self.colorRampComboBox.deleteLater()
+        self.colorRampButton = color_ramp_button
+
+    def _set_preferred_color_ramp(self, preferred_ramps: tuple[str, ...]) -> None:
+        """Set the first available preferred color ramp on the native picker."""
+
+        if self.colorRampButton is None:
+            return
+        style = QgsStyle.defaultStyle()
+        for ramp_name in preferred_ramps:
+            color_ramp = style.colorRamp(ramp_name)
+            if color_ramp is not None:
+                self.colorRampButton.setColorRamp(color_ramp)
+                return
+
+    def _current_color_ramp(self) -> QgsColorRamp | None:
+        """Return the currently selected QGIS color ramp instance."""
+
+        if self.colorRampButton is not None:
+            return self.colorRampButton.colorRamp()
+        ramp_name = self.colorRampComboBox.currentText().strip()
+        if not ramp_name:
+            return None
+        return QgsStyle.defaultStyle().colorRamp(ramp_name)
+
+    def _current_color_ramp_name(self) -> str | None:
+        """Return the currently selected color-ramp name when available."""
+
+        if self.colorRampButton is not None:
+            return None
+        ramp_name = self.colorRampComboBox.currentText().strip()
+        return ramp_name or None
+
     def _apply_preview_renderer(self) -> None:
         """Apply the chosen color ramp and value range to the preview layer."""
 
@@ -1431,11 +1509,12 @@ class InSARViewerDockWidget(QDockWidget):
         try:
             apply_color_ramp_renderer(
                 layer=preview_layer,
-                ramp_name=self.colorRampComboBox.currentText(),
+                ramp_name=self._current_color_ramp_name(),
                 minimum_value=float(self.minValueDoubleSpinBox.value()),
                 maximum_value=float(self.maxValueDoubleSpinBox.value()),
                 render_mode=str(self.renderModeComboBox.currentData()),
                 opacity=self._current_preview_opacity(),
+                color_ramp=self._current_color_ramp(),
             )
         except Exception as exc:
             logger.error("Failed to apply raster renderer: %s", exc)
