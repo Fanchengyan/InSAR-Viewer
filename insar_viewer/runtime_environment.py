@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from .dependency_path import is_plugin_managed_path
 from .logging import setup_logger
 
 logger = setup_logger(__name__)
@@ -405,12 +406,12 @@ def _prioritized_sys_path(
 
 
 def _purge_modules_outside_prefix(module_prefixes: tuple[str, ...]) -> None:
-    """Remove targeted modules imported from outside the active prefix.
+    """Remove targeted modules imported from outside supported dependency paths.
 
     Parameters
     ----------
     module_prefixes : tuple[str, ...]
-        Module prefixes that should be re-imported from ``sys.prefix``.
+        Module prefixes that should be re-imported from QGIS or plugin paths.
     """
 
     removed_module_names: list[str] = []
@@ -418,26 +419,27 @@ def _purge_modules_outside_prefix(module_prefixes: tuple[str, ...]) -> None:
         if not _module_name_matches_prefixes(module_name, module_prefixes):
             continue
         module_origin = module_origin_path(module_name, module_object)
-        if is_module_origin_in_active_prefix(module_origin):
+        if is_module_origin_supported(module_origin):
             continue
         sys.modules.pop(module_name, None)
         removed_module_names.append(module_name)
 
     if removed_module_names:
         logger.warning(
-            "Removed modules imported outside the active prefix: %s",
+            "Removed modules imported outside supported dependency paths: %s",
             ", ".join(sorted(removed_module_names)),
         )
 
 
 @contextmanager
 def prefer_active_prefix_imports(module_prefixes: tuple[str, ...]) -> Iterator[None]:
-    """Temporarily prioritize ``sys.prefix`` site-packages for selected imports.
+    """Temporarily prioritize QGIS packages for selected imports.
 
     Parameters
     ----------
     module_prefixes : tuple[str, ...]
-        Module prefixes that should be re-imported from ``sys.prefix``.
+        Module prefixes that should be re-imported from QGIS first, then plugin
+        managed dependencies.
 
     Yields
     ------
@@ -530,11 +532,31 @@ def is_module_origin_in_active_prefix(module_origin: Path | None) -> bool:
     return _is_relative_to(module_origin, prefix_path)
 
 
+def is_module_origin_supported(module_origin: Path | None) -> bool:
+    """Return whether a module origin belongs to a supported dependency path.
+
+    Parameters
+    ----------
+    module_origin : Path | None
+        Module origin path.
+
+    Returns
+    -------
+    bool
+        ``True`` when the origin is inside the active QGIS prefix or the
+        runtime-specific plugin-managed dependency directory.
+    """
+
+    return is_module_origin_in_active_prefix(module_origin) or is_plugin_managed_path(
+        module_origin
+    )
+
+
 def ensure_module_origin_in_active_prefix(
     module_name: str,
     module_object: Any,
 ) -> None:
-    """Raise when a native dependency comes from outside the QGIS prefix.
+    """Raise when a native dependency comes from an unsupported path.
 
     Parameters
     ----------
@@ -546,11 +568,12 @@ def ensure_module_origin_in_active_prefix(
     Raises
     ------
     RuntimeError
-        Raised when the imported module originates outside ``sys.prefix``.
+        Raised when the imported module originates outside QGIS and plugin
+        managed dependency paths.
     """
 
     module_origin = module_origin_path(module_name, module_object)
-    if is_module_origin_in_active_prefix(module_origin):
+    if is_module_origin_supported(module_origin):
         return
 
     logger.error(
@@ -561,7 +584,7 @@ def ensure_module_origin_in_active_prefix(
     )
     raise RuntimeError(
         f"Dependency '{module_name}' was imported from {module_origin}, which is "
-        f"outside the active QGIS Python environment ({sys.prefix}). Install the "
-        "plugin dependencies into the QGIS environment instead of the Python "
-        "user site directory."
+        f"outside the active QGIS Python environment ({sys.prefix}) and the "
+        "InSAR Viewer managed dependency directory. Clear external user-site "
+        "packages or reinstall the plugin dependencies."
     )

@@ -8,16 +8,22 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from PyQt5.QtCore import pyqtSignal
 from qgis.core import QgsTask
 
+from .dependency_path import (
+    is_plugin_managed_path,
+    register_plugin_managed_dependency_path,
+)
 from .logging import setup_logger
 from .runtime_environment import (
     configure_native_data_paths,
     is_module_origin_in_active_prefix,
+    is_module_origin_supported,
     module_spec_origin_path,
     prefer_active_prefix_imports,
 )
@@ -60,11 +66,17 @@ class DependencyStatus:
         Whether the import target can be resolved.
     version : str | None
         Installed distribution version when available.
+    source : str
+        Dependency source shown in the UI.
+    origin : Path | None
+        Resolved module origin path when available.
     """
 
     dependency: DependencySpec
     installed: bool
     version: str | None
+    source: str
+    origin: Path | None
 
 
 REQUIRED_DEPENDENCIES: tuple[DependencySpec, ...] = (
@@ -132,6 +144,7 @@ def dependency_statuses() -> list[DependencyStatus]:
     """
 
     statuses: list[DependencyStatus] = []
+    register_plugin_managed_dependency_path()
     with prefer_active_prefix_imports(
         ("pyproj", "rasterio", "rioxarray", "xarray", "cftime")
     ):
@@ -139,7 +152,7 @@ def dependency_statuses() -> list[DependencyStatus]:
             module_origin = module_spec_origin_path(dependency.import_name)
             installed = module_origin is not None
             if installed and dependency.import_name in {"pyproj", "rasterio"}:
-                installed = is_module_origin_in_active_prefix(module_origin)
+                installed = is_module_origin_supported(module_origin)
             version = (
                 _distribution_version(dependency.package_name) if installed else None
             )
@@ -148,6 +161,8 @@ def dependency_statuses() -> list[DependencyStatus]:
                     dependency=dependency,
                     installed=installed,
                     version=version,
+                    source=_dependency_source(module_origin) if installed else "-",
+                    origin=module_origin,
                 )
             )
     return statuses
@@ -168,12 +183,44 @@ def missing_dependencies() -> list[DependencySpec]:
 
 
 def _distribution_version(package_name: str) -> str | None:
-    """Return an installed distribution version when available."""
+    """Return an installed distribution version when available.
+
+    Parameters
+    ----------
+    package_name : str
+        Distribution name to query.
+
+    Returns
+    -------
+    str | None
+        Installed version, or ``None`` when the distribution is unavailable.
+    """
 
     try:
         return importlib.metadata.version(package_name)
     except importlib.metadata.PackageNotFoundError:
         return None
+
+
+def _dependency_source(module_origin: Path | None) -> str:
+    """Return a short dependency source label for a module origin.
+
+    Parameters
+    ----------
+    module_origin : Path | None
+        Resolved module origin path.
+
+    Returns
+    -------
+    str
+        Human-readable dependency source label.
+    """
+
+    if is_module_origin_in_active_prefix(module_origin):
+        return "QGIS runtime"
+    if is_plugin_managed_path(module_origin):
+        return "InSAR Viewer managed"
+    return "External"
 
 
 def _is_relative_to(path: Path, other_path: Path) -> bool:
@@ -422,7 +469,73 @@ def build_dependency_install_environment(
         if frameworks_path.is_dir():
             environment["PYTHONHOME"] = str(frameworks_path)
 
+    environment["PYTHONNOUSERSITE"] = "1"
     return environment
+
+
+def build_runtime_constraints_file() -> Path:
+    """Create a pip constraints file from packages already in the QGIS runtime.
+
+    Returns
+    -------
+    Path
+        Temporary constraints file path. The caller is responsible for deleting
+        the file after pip exits.
+    """
+
+    constraints: dict[str, str] = {}
+    for distribution in importlib.metadata.distributions():
+        distribution_name = distribution.metadata.get("Name")
+        distribution_version = distribution.version
+        if not distribution_name or not distribution_version:
+            continue
+        distribution_path = _distribution_root_path(distribution)
+        if distribution_path is None:
+            continue
+        if not is_module_origin_in_active_prefix(distribution_path):
+            continue
+        normalized_name = distribution_name.casefold()
+        constraints[normalized_name] = f"{distribution_name}=={distribution_version}"
+
+    constraints_file = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        delete=False,
+        prefix="insar-viewer-pip-constraints-",
+        suffix=".txt",
+    )
+    with constraints_file:
+        for requirement in sorted(constraints.values(), key=str.casefold):
+            constraints_file.write(f"{requirement}\n")
+    return Path(constraints_file.name)
+
+
+def _distribution_root_path(
+    distribution: importlib.metadata.Distribution,
+) -> Path | None:
+    """Return the normalized root path for an installed distribution.
+
+    Parameters
+    ----------
+    distribution : importlib.metadata.Distribution
+        Distribution metadata object.
+
+    Returns
+    -------
+    Path | None
+        Distribution root path when available.
+    """
+
+    try:
+        distribution_path = distribution.locate_file("")
+    except Exception as exc:
+        logger.warning("Failed to locate distribution %s: %s", distribution, exc)
+        return None
+    try:
+        return Path(distribution_path).expanduser().resolve()
+    except OSError:
+        logger.warning("Failed to normalize distribution path: %s", distribution_path)
+        return None
 
 
 class DependencyInstallTask(QgsTask):
@@ -465,17 +578,25 @@ class DependencyInstallTask(QgsTask):
             self.logMessage.emit(self.error_message)
             return False
 
+        target_path = register_plugin_managed_dependency_path(create=True)
+        constraints_file = build_runtime_constraints_file()
         command = [
             str(python_executable),
             "-m",
             "pip",
             "install",
-            "--user",
+            "--target",
+            str(target_path),
+            "--constraint",
+            str(constraints_file),
+            "--disable-pip-version-check",
+            "--no-warn-script-location",
             "--upgrade-strategy",
             "only-if-needed",
             *[dependency.pip_spec for dependency in self.dependencies],
         ]
         environment = build_dependency_install_environment(python_executable)
+        self.logMessage.emit(f"Installing into: {target_path}")
         self.logMessage.emit(
             "Running: " + " ".join(shlex.quote(argument) for argument in command)
         )
@@ -492,23 +613,29 @@ class DependencyInstallTask(QgsTask):
             logger.error("Failed to start dependency installation: %s", exc)
             self.error_message = str(exc)
             self.logMessage.emit(f"Failed to start pip: {exc}")
+            constraints_file.unlink(missing_ok=True)
             return False
 
-        if process.stdout is not None:
-            for line in process.stdout:
-                if self.isCanceled():
-                    process.terminate()
-                    self.error_message = "Installation was canceled."
-                    self.logMessage.emit(self.error_message)
-                    return False
-                self.logMessage.emit(line.rstrip())
+        try:
+            if process.stdout is not None:
+                for line in process.stdout:
+                    if self.isCanceled():
+                        process.terminate()
+                        self.error_message = "Installation was canceled."
+                        self.logMessage.emit(self.error_message)
+                        return False
+                    self.logMessage.emit(line.rstrip())
 
-        return_code = process.wait()
+            return_code = process.wait()
+        finally:
+            constraints_file.unlink(missing_ok=True)
+
         if return_code != 0:
             self.error_message = f"pip exited with status {return_code}."
             logger.error(self.error_message)
             self.logMessage.emit(self.error_message)
             return False
+        register_plugin_managed_dependency_path()
         self.logMessage.emit("Dependency installation completed.")
         return True
 

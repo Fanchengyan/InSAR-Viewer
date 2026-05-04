@@ -158,7 +158,7 @@ def _open_source_dataset(
         raise RuntimeError(
             "Unable to open the dataset with rioxarray.open_rasterio: "
             f"{exc}. Ensure the required runtime dependencies are installed in "
-            "the QGIS Python environment."
+            "QGIS or the InSAR Viewer managed dependency directory."
         ) from exc
 
 

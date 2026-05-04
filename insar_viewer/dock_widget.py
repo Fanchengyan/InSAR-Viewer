@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from PyQt5 import uic
-from PyQt5.QtCore import QObject, pyqtSignal
-from PyQt5.QtGui import QColor
+from PyQt5.QtCore import QObject, QUrl, pyqtSignal
+from PyQt5.QtGui import QColor, QDesktopServices
 from PyQt5.QtWidgets import (
     QColorDialog,
     QDockWidget,
@@ -53,6 +53,12 @@ from .dependencies import (
     DependencyInstallTask,
     dependency_statuses,
     missing_dependencies,
+)
+from .dependency_path import (
+    clear_all_plugin_managed_site_packages,
+    clear_current_plugin_managed_site_packages,
+    get_plugin_managed_dependency_stats,
+    get_plugin_managed_site_packages,
 )
 from .exporters import export_array_geotiff, export_sampled_series_table
 from .logging import setup_logger
@@ -211,6 +217,8 @@ class InSARViewerDockWidget(QDockWidget):
             "addReferencePointButton",
             "addSeriesPointButton",
             "autoValueRangeCheckBox",
+            "clearAllDependenciesButton",
+            "clearCurrentDependenciesButton",
             "clearReferencePointsButton",
             "clearSeriesPointsButton",
             "colorRampComboBox",
@@ -236,6 +244,7 @@ class InSARViewerDockWidget(QDockWidget):
             "minValueDoubleSpinBox",
             "opacityDoubleSpinBox",
             "opacitySlider",
+            "openDependenciesFolderButton",
             "pointPlotEndComboBox",
             "pointPlotPlaceholder",
             "pointPlotStartComboBox",
@@ -358,9 +367,9 @@ class InSARViewerDockWidget(QDockWidget):
             int(DEFAULT_LAYER_OPACITY_PERCENT * OPACITY_SLIDER_SCALE)
         )
         self.opacityDoubleSpinBox.setValue(DEFAULT_LAYER_OPACITY_PERCENT)
-        self.dependenciesTableWidget.setColumnCount(3)
+        self.dependenciesTableWidget.setColumnCount(4)
         self.dependenciesTableWidget.setHorizontalHeaderLabels(
-            ["Package", "Status", "Version"]
+            ["Package", "Status", "Version", "Source"]
         )
         self.dependenciesTableWidget.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeToContents
@@ -489,6 +498,15 @@ class InSARViewerDockWidget(QDockWidget):
         )
         self.installDependenciesButton.clicked.connect(
             self._install_missing_dependencies
+        )
+        self.openDependenciesFolderButton.clicked.connect(
+            self._open_plugin_dependency_folder
+        )
+        self.clearCurrentDependenciesButton.clicked.connect(
+            self._clear_current_plugin_dependencies
+        )
+        self.clearAllDependenciesButton.clicked.connect(
+            self._clear_all_plugin_dependencies
         )
 
     def _set_stack_axis_ui_labels(self, is_temporal: bool) -> None:
@@ -630,6 +648,7 @@ class InSARViewerDockWidget(QDockWidget):
                 QTableWidgetItem(dependency.package_name),
                 QTableWidgetItem(status_text),
                 QTableWidgetItem(status.version or "-"),
+                QTableWidgetItem(status.source),
             )
             status_color = QColor("#1a9850") if status.installed else QColor("#d73027")
             for column_index, item in enumerate(row_items):
@@ -640,10 +659,17 @@ class InSARViewerDockWidget(QDockWidget):
         self.installDependenciesButton.setEnabled(
             missing_count > 0 and self.dependency_install_task is None
         )
+        dependency_stats = get_plugin_managed_dependency_stats(
+            get_plugin_managed_site_packages()
+        )
+        stats_text = (
+            f"Managed directory: {dependency_stats['file_count']} files, "
+            f"{dependency_stats['size_bytes'] / (1024 * 1024):.1f} MB."
+        )
         self.dependenciesInfoLabel.setText(
             f"Dependencies: {len(statuses) - missing_count} installed, "
-            f"{missing_count} missing. Installation runs in the QGIS background "
-            "task manager."
+            f"{missing_count} missing. Missing packages install into the hidden "
+            f"plugin dependency directory for this QGIS runtime. {stats_text}"
         )
 
     def _install_missing_dependencies(self) -> None:
@@ -668,6 +694,70 @@ class InSARViewerDockWidget(QDockWidget):
         task.installFinished.connect(self._handle_dependency_install_finished)
         self.dependency_install_task = task
         QgsApplication.taskManager().addTask(task)
+
+    def _open_plugin_dependency_folder(self) -> None:
+        """Open the plugin-managed dependency directory for this runtime."""
+
+        dependency_path = get_plugin_managed_site_packages(create=True)
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(dependency_path))):
+            logger.error("Failed to open dependency directory: %s", dependency_path)
+            self._append_dependency_log(
+                f"Failed to open dependency directory: {dependency_path}"
+            )
+
+    def _clear_current_plugin_dependencies(self) -> None:
+        """Clear plugin-managed dependencies for the active QGIS runtime."""
+
+        dependency_path = get_plugin_managed_site_packages()
+        if dependency_path.exists() and not self._confirm_dependency_clear(
+            "Clear Current Runtime Dependencies",
+            "Clear dependencies installed for this QGIS runtime?",
+        ):
+            return
+        removed_count = clear_current_plugin_managed_site_packages()
+        self._append_dependency_log(
+            f"Cleared {removed_count} files from current runtime dependencies."
+        )
+        self._refresh_dependency_statuses()
+
+    def _clear_all_plugin_dependencies(self) -> None:
+        """Clear all plugin-managed dependency directories."""
+
+        if not self._confirm_dependency_clear(
+            "Clear All Managed Dependencies",
+            "Clear dependencies installed by InSAR Viewer for all QGIS runtimes?",
+        ):
+            return
+        removed_count = clear_all_plugin_managed_site_packages()
+        self._append_dependency_log(
+            f"Cleared {removed_count} files from all managed dependency directories."
+        )
+        self._refresh_dependency_statuses()
+
+    def _confirm_dependency_clear(self, title: str, message: str) -> bool:
+        """Return whether the user confirmed dependency deletion.
+
+        Parameters
+        ----------
+        title : str
+            Dialog title.
+        message : str
+            Dialog message.
+
+        Returns
+        -------
+        bool
+            ``True`` when deletion was confirmed.
+        """
+
+        reply = QMessageBox.question(
+            self,
+            title,
+            message,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
 
     def _append_dependency_log(self, message: str) -> None:
         """Append a line to the dependency installation log."""

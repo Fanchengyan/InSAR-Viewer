@@ -900,6 +900,11 @@
             <string>Version</string>
            </property>
           </column>
+          <column>
+           <property name="text">
+            <string>Source</string>
+           </property>
+          </column>
          </widget>
         </item>
         <item>
@@ -915,6 +920,31 @@
            <widget class="QPushButton" name="installDependenciesButton">
             <property name="text">
              <string>Install Missing</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QPushButton" name="openDependenciesFolderButton">
+            <property name="text">
+             <string>Open Folder</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </item>
+        <item>
+         <layout class="QHBoxLayout" name="dependencyClearButtonsLayout">
+          <item>
+           <widget class="QPushButton" name="clearCurrentDependenciesButton">
+            <property name="text">
+             <string>Clear Current Runtime</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QPushButton" name="clearAllDependenciesButton">
+            <property name="text">
+             <string>Clear All Managed</string>
             </property>
            </widget>
           </item>
