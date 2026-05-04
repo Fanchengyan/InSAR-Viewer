@@ -222,7 +222,7 @@ def clear_all_plugin_managed_site_packages() -> int:
 
 
 def _dependency_path_insert_index() -> int:
-    """Return a sys.path index after active-prefix site-package entries.
+    """Return a sys.path index that does not shadow QGIS packages.
 
     Returns
     -------
@@ -231,7 +231,7 @@ def _dependency_path_insert_index() -> int:
     """
 
     prefix_path = Path(sys.prefix).expanduser().resolve()
-    insert_index = 0
+    insert_index: int | None = None
     for index, path_entry in enumerate(sys.path):
         normalized_path = _normalize_path(path_entry)
         if normalized_path is None:
@@ -240,7 +240,9 @@ def _dependency_path_insert_index() -> int:
             continue
         if _is_relative_to(normalized_path, prefix_path):
             insert_index = index + 1
-    return insert_index
+    if insert_index is not None:
+        return insert_index
+    return len(sys.path)
 
 
 def _runtime_dependency_key() -> str:

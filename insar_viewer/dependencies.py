@@ -7,6 +7,7 @@ import importlib.metadata
 import importlib.util
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,7 @@ from .logging import setup_logger
 from .runtime_environment import (
     configure_native_data_paths,
     is_module_origin_in_active_prefix,
+    is_module_origin_in_qgis_runtime,
     is_module_origin_supported,
     module_spec_origin_path,
     prefer_active_prefix_imports,
@@ -92,12 +94,12 @@ REQUIRED_DEPENDENCIES: tuple[DependencySpec, ...] = (
     DependencySpec(
         package_name="xarray",
         import_name="xarray",
-        pip_spec="xarray>=2024.1.0,<2026.0.0",
+        pip_spec="xarray>=2024.1.0,<2025.0.0",
     ),
     DependencySpec(
         package_name="dask",
         import_name="dask",
-        pip_spec="dask[array]>=2024.1.0,<2026.0.0",
+        pip_spec="dask>=2024.1.0,<2025.0.0",
     ),
     DependencySpec(
         package_name="rioxarray",
@@ -107,7 +109,7 @@ REQUIRED_DEPENDENCIES: tuple[DependencySpec, ...] = (
     DependencySpec(
         package_name="rasterio",
         import_name="rasterio",
-        pip_spec="rasterio>=1.4.0",
+        pip_spec="rasterio>=1.4.0,<1.5.0",
     ),
     DependencySpec(
         package_name="pyproj",
@@ -122,7 +124,7 @@ REQUIRED_DEPENDENCIES: tuple[DependencySpec, ...] = (
     DependencySpec(
         package_name="pandas",
         import_name="pandas",
-        pip_spec="pandas>=2.2.0",
+        pip_spec="pandas>=2.2.0,<3.0.0",
     ),
     DependencySpec(
         package_name="openpyxl",
@@ -136,6 +138,21 @@ REQUIRED_DEPENDENCIES: tuple[DependencySpec, ...] = (
         required=False,
     ),
 )
+
+RUNTIME_CONSTRAINED_DISTRIBUTIONS: dict[str, str] = {
+    "numpy": "numpy",
+    "pandas": "pandas",
+    "packaging": "packaging",
+    "python-dateutil": "dateutil",
+    "pytz": "pytz",
+    "pyyaml": "yaml",
+    "click": "click",
+    "certifi": "certifi",
+    "pyproj": "pyproj",
+}
+RUNTIME_CONSTRAINT_EXCLUDED_DISTRIBUTIONS: set[str] = {
+    "rasterio",
+}
 
 
 def dependency_statuses() -> list[DependencyStatus]:
@@ -185,6 +202,156 @@ def missing_dependencies() -> list[DependencySpec]:
     ]
 
 
+def dependency_install_specs(dependencies: list[DependencySpec]) -> list[str]:
+    """Return pip requirements adapted to the active QGIS numpy version.
+
+    Parameters
+    ----------
+    dependencies : list[DependencySpec]
+        Dependencies selected for installation.
+
+    Returns
+    -------
+    list[str]
+        Pip requirement strings.
+    """
+
+    numpy_major_version = active_qgis_numpy_major_version()
+    return [
+        _dependency_install_spec(dependency, numpy_major_version)
+        for dependency in dependencies
+    ]
+
+
+def runtime_resolver_constraints() -> list[str]:
+    """Return resolver constraints derived from the active QGIS runtime.
+
+    Returns
+    -------
+    list[str]
+        Additional pip constraints that keep plugin-managed dependencies
+        compatible with packages already loaded from QGIS.
+    """
+
+    constraints = active_prefix_distribution_constraints()
+    constraints.extend(_numpy_compatibility_constraints())
+    return constraints
+
+
+def active_prefix_distribution_constraints() -> list[str]:
+    """Return exact constraints for distributions provided by QGIS.
+
+    Returns
+    -------
+    list[str]
+        Requirements such as ``numpy==1.26.4`` for packages provided by QGIS.
+    """
+
+    constraints: dict[str, str] = {}
+    for distribution_name, module_name in RUNTIME_CONSTRAINED_DISTRIBUTIONS.items():
+        distribution_version = _active_runtime_distribution_version(
+            distribution_name,
+            module_name,
+        )
+        if distribution_version is None:
+            continue
+        constraints[distribution_name.casefold()] = (
+            f"{distribution_name}=={distribution_version}"
+        )
+
+    for distribution in importlib.metadata.distributions():
+        distribution_name = distribution.metadata.get("Name")
+        distribution_version = distribution.version
+        if not distribution_name or not distribution_version:
+            continue
+        normalized_name = distribution_name.casefold()
+        if normalized_name in RUNTIME_CONSTRAINT_EXCLUDED_DISTRIBUTIONS:
+            continue
+        distribution_path = _distribution_root_path(distribution)
+        if distribution_path is None:
+            continue
+        if not is_module_origin_in_active_prefix(distribution_path):
+            continue
+        constraints[normalized_name] = f"{distribution_name}=={distribution_version}"
+    return sorted(constraints.values(), key=str.casefold)
+
+
+def active_qgis_numpy_major_version() -> int | None:
+    """Return the major version of numpy installed in the active QGIS prefix.
+
+    Returns
+    -------
+    int | None
+        QGIS-provided numpy major version, or ``None`` when it cannot be
+        resolved.
+    """
+
+    numpy_version = _active_runtime_distribution_version("numpy", "numpy")
+    if numpy_version is None:
+        return None
+    version_head = numpy_version.split(".", maxsplit=1)[0]
+    try:
+        return int(version_head)
+    except ValueError:
+        logger.warning("Could not parse active QGIS numpy version: %s", numpy_version)
+        return None
+
+
+def _dependency_install_spec(
+    dependency: DependencySpec,
+    numpy_major_version: int | None,
+) -> str:
+    """Return a numpy-aware pip spec for one dependency.
+
+    Parameters
+    ----------
+    dependency : DependencySpec
+        Dependency selected for installation.
+    numpy_major_version : int | None
+        Major version of numpy from the active QGIS prefix.
+
+    Returns
+    -------
+    str
+        Pip requirement string.
+    """
+
+    if numpy_major_version is None or numpy_major_version < 2:
+        return dependency.pip_spec
+
+    relaxed_specs = {
+        "xarray": "xarray>=2024.1.0,<2026.0.0",
+        "dask": "dask>=2024.1.0,<2026.0.0",
+        "pandas": "pandas>=2.2.0",
+        "rasterio": "rasterio>=1.4.0",
+    }
+    return relaxed_specs.get(dependency.package_name, dependency.pip_spec)
+
+
+def _numpy_compatibility_constraints() -> list[str]:
+    """Return package constraints required by the QGIS numpy major version.
+
+    Returns
+    -------
+    list[str]
+        Constraints for packages whose newer releases can assume newer numpy
+        APIs than QGIS provides.
+    """
+
+    numpy_major_version = active_qgis_numpy_major_version()
+    if numpy_major_version is None or numpy_major_version < 2:
+        return [
+            "xarray<2025.0.0",
+            "dask<2025.0.0",
+            "pandas<3.0.0",
+            "rasterio<1.5.0",
+        ]
+    return [
+        "xarray<2026.0.0",
+        "dask<2026.0.0",
+    ]
+
+
 def _distribution_version(package_name: str) -> str | None:
     """Return an installed distribution version when available.
 
@@ -203,6 +370,62 @@ def _distribution_version(package_name: str) -> str | None:
         return importlib.metadata.version(package_name)
     except importlib.metadata.PackageNotFoundError:
         return None
+
+
+def _active_runtime_distribution_version(
+    package_name: str,
+    module_name: str,
+) -> str | None:
+    """Return a distribution version from QGIS or another non-plugin path.
+
+    Parameters
+    ----------
+    package_name : str
+        Distribution name to query.
+    module_name : str
+        Importable module name used to verify the runtime origin.
+
+    Returns
+    -------
+    str | None
+        Installed version outside plugin-managed dependencies, or ``None`` when
+        unavailable.
+    """
+
+    module_origin = module_spec_origin_path(module_name)
+    if module_origin is not None and not is_plugin_managed_path(module_origin):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError as exc:
+            logger.warning(
+                "Could not import runtime module %s for constraints: %s",
+                module_name,
+                exc,
+            )
+        else:
+            module_version = getattr(module, "__version__", None)
+            if isinstance(module_version, str) and module_version:
+                return module_version
+
+    normalized_package_name = package_name.casefold()
+    for distribution in importlib.metadata.distributions():
+        distribution_name = distribution.metadata.get("Name")
+        if distribution_name is None:
+            continue
+        if distribution_name.casefold() != normalized_package_name:
+            continue
+        distribution_path = _distribution_root_path(distribution)
+        if distribution_path is None:
+            continue
+        if is_plugin_managed_path(distribution_path):
+            continue
+        if not (
+            is_module_origin_in_active_prefix(distribution_path)
+            or module_origin is not None
+        ):
+            continue
+        return distribution.version
+    return None
 
 
 def _probe_dependency_import(
@@ -263,7 +486,7 @@ def _dependency_source(module_origin: Path | None) -> str:
         Human-readable dependency source label.
     """
 
-    if is_module_origin_in_active_prefix(module_origin):
+    if is_module_origin_in_qgis_runtime(module_origin):
         return "QGIS runtime"
     if is_plugin_managed_path(module_origin):
         return "InSAR Viewer managed"
@@ -530,20 +753,6 @@ def build_runtime_constraints_file() -> Path:
         the file after pip exits.
     """
 
-    constraints: dict[str, str] = {}
-    for distribution in importlib.metadata.distributions():
-        distribution_name = distribution.metadata.get("Name")
-        distribution_version = distribution.version
-        if not distribution_name or not distribution_version:
-            continue
-        distribution_path = _distribution_root_path(distribution)
-        if distribution_path is None:
-            continue
-        if not is_module_origin_in_active_prefix(distribution_path):
-            continue
-        normalized_name = distribution_name.casefold()
-        constraints[normalized_name] = f"{distribution_name}=={distribution_version}"
-
     constraints_file = tempfile.NamedTemporaryFile(
         "w",
         encoding="utf-8",
@@ -552,9 +761,114 @@ def build_runtime_constraints_file() -> Path:
         suffix=".txt",
     )
     with constraints_file:
-        for requirement in sorted(constraints.values(), key=str.casefold):
+        for requirement in runtime_resolver_constraints():
             constraints_file.write(f"{requirement}\n")
     return Path(constraints_file.name)
+
+
+def prune_runtime_provided_target_packages(target_path: Path) -> list[str]:
+    """Remove target packages that are already provided by QGIS.
+
+    Parameters
+    ----------
+    target_path : Path
+        Plugin-managed pip target directory.
+
+    Returns
+    -------
+    list[str]
+        Distribution names removed from the target directory.
+    """
+
+    runtime_package_names = _runtime_provided_package_names()
+    if not target_path.exists() or not runtime_package_names:
+        return []
+
+    removed_names: list[str] = []
+    for distribution in importlib.metadata.distributions(path=[str(target_path)]):
+        distribution_name = distribution.metadata.get("Name")
+        if distribution_name is None:
+            continue
+        if distribution_name.casefold() not in runtime_package_names:
+            continue
+        _remove_target_distribution(distribution, target_path)
+        removed_names.append(distribution_name)
+    return sorted(removed_names, key=str.casefold)
+
+
+def _runtime_provided_package_names() -> set[str]:
+    """Return normalized package names exactly provided by QGIS.
+
+    Returns
+    -------
+    set[str]
+        Package names from exact runtime constraints.
+    """
+
+    package_names: set[str] = set()
+    for constraint in active_prefix_distribution_constraints():
+        if "==" not in constraint:
+            continue
+        package_name = constraint.split("==", maxsplit=1)[0].strip().casefold()
+        if package_name:
+            package_names.add(package_name)
+    return package_names
+
+
+def _remove_target_distribution(
+    distribution: importlib.metadata.Distribution,
+    target_path: Path,
+) -> None:
+    """Remove files belonging to one target distribution.
+
+    Parameters
+    ----------
+    distribution : importlib.metadata.Distribution
+        Distribution installed in the plugin-managed target directory.
+    target_path : Path
+        Plugin-managed pip target directory.
+    """
+
+    distribution_files = distribution.files
+    if distribution_files is None:
+        logger.warning("Cannot remove distribution without RECORD: %s", distribution)
+        return
+
+    resolved_target_path = target_path.resolve()
+    parent_paths: set[Path] = set()
+    for distribution_file in distribution_files:
+        file_path = Path(distribution.locate_file(distribution_file))
+        try:
+            file_path.relative_to(resolved_target_path)
+        except ValueError:
+            logger.warning("Ignoring dependency file outside target: %s", file_path)
+            continue
+        parent_paths.update(file_path.parents)
+        if file_path.is_dir():
+            shutil.rmtree(file_path, ignore_errors=True)
+            continue
+        try:
+            file_path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.warning("Failed to remove dependency file %s: %s", file_path, exc)
+
+    for parent_path in sorted(
+        parent_paths,
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        if parent_path == resolved_target_path:
+            continue
+        try:
+            parent_path.relative_to(resolved_target_path)
+        except ValueError:
+            continue
+        try:
+            parent_path.rmdir()
+        except OSError:
+            continue
 
 
 def _distribution_root_path(
@@ -641,10 +955,16 @@ class DependencyInstallTask(QgsTask):
             "--upgrade",
             "--upgrade-strategy",
             "only-if-needed",
-            *[dependency.pip_spec for dependency in self.dependencies],
+            *dependency_install_specs(self.dependencies),
         ]
         environment = build_dependency_install_environment(python_executable)
         self.logMessage.emit(f"Installing into: {target_path}")
+        numpy_major_version = active_qgis_numpy_major_version()
+        if numpy_major_version is not None:
+            self.logMessage.emit(
+                f"Detected QGIS numpy major version: {numpy_major_version}"
+            )
+        self._log_runtime_constraints()
         self.logMessage.emit(
             "Running: " + " ".join(shlex.quote(argument) for argument in command)
         )
@@ -683,9 +1003,30 @@ class DependencyInstallTask(QgsTask):
             logger.error(self.error_message)
             self.logMessage.emit(self.error_message)
             return False
+        removed_names = prune_runtime_provided_target_packages(target_path)
+        if removed_names:
+            self.logMessage.emit(
+                "Removed QGIS-provided packages from managed target: "
+                + ", ".join(removed_names)
+            )
         register_plugin_managed_dependency_path()
         self.logMessage.emit("Dependency installation completed.")
         return True
+
+    def _log_runtime_constraints(self) -> None:
+        """Log key resolver constraints used for dependency installation."""
+
+        key_prefixes = ("numpy", "xarray", "dask", "pandas", "rasterio")
+        key_constraints = [
+            constraint
+            for constraint in runtime_resolver_constraints()
+            if constraint.startswith(key_prefixes)
+        ]
+        if not key_constraints:
+            return
+        self.logMessage.emit(
+            "Runtime constraints: " + ", ".join(sorted(key_constraints))
+        )
 
     def finished(self, result: bool) -> None:
         """Emit task completion information on the main thread."""

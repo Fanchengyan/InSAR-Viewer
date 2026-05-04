@@ -532,6 +532,63 @@ def is_module_origin_in_active_prefix(module_origin: Path | None) -> bool:
     return _is_relative_to(module_origin, prefix_path)
 
 
+def is_module_origin_in_qgis_runtime(module_origin: Path | None) -> bool:
+    """Return whether a module origin belongs to the active QGIS runtime.
+
+    Parameters
+    ----------
+    module_origin : Path | None
+        Module origin path.
+
+    Returns
+    -------
+    bool
+        ``True`` when the origin is inside ``sys.prefix`` or the active QGIS
+        application bundle.
+    """
+
+    if module_origin is None or is_plugin_managed_path(module_origin):
+        return False
+    if is_module_origin_in_active_prefix(module_origin):
+        return True
+    return any(
+        _is_relative_to(module_origin, runtime_root)
+        for runtime_root in _active_qgis_runtime_roots()
+    )
+
+
+def _active_qgis_runtime_roots() -> list[Path]:
+    """Return known filesystem roots for the active QGIS runtime.
+
+    Returns
+    -------
+    list[Path]
+        Runtime roots inferred from ``sys.prefix`` and ``sys.executable``.
+    """
+
+    candidate_roots: list[Path] = []
+    for raw_path in (
+        sys.prefix,
+        getattr(sys, "base_prefix", ""),
+        sys.executable,
+    ):
+        if not raw_path:
+            continue
+        try:
+            path = Path(raw_path).expanduser().resolve()
+        except OSError:
+            continue
+        for candidate_path in (path, *path.parents):
+            if candidate_path.name != "Contents":
+                continue
+            if candidate_path.parent.suffix != ".app":
+                continue
+            if candidate_path not in candidate_roots:
+                candidate_roots.append(candidate_path)
+            break
+    return candidate_roots
+
+
 def is_module_origin_supported(module_origin: Path | None) -> bool:
     """Return whether a module origin belongs to a supported dependency path.
 
@@ -543,11 +600,11 @@ def is_module_origin_supported(module_origin: Path | None) -> bool:
     Returns
     -------
     bool
-        ``True`` when the origin is inside the active QGIS prefix or the
+        ``True`` when the origin is inside the active QGIS runtime or the
         runtime-specific plugin-managed dependency directory.
     """
 
-    return is_module_origin_in_active_prefix(module_origin) or is_plugin_managed_path(
+    return is_module_origin_in_qgis_runtime(module_origin) or is_plugin_managed_path(
         module_origin
     )
 
