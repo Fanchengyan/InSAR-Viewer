@@ -17,6 +17,8 @@ SUPPORTED_DATA_SUFFIXES: tuple[str, ...] = (
     ".h5",
     ".hdf5",
     ".he5",
+    ".tif",
+    ".tiff",
 )
 
 TIME_DIMENSION_ALIASES: tuple[str, ...] = (

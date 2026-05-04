@@ -17,6 +17,163 @@ from .logging import setup_logger
 logger = setup_logger(__name__)
 
 
+def _candidate_proj_directories_from_sys_executable() -> list[Path]:
+    """Return PROJ directories inferred from the active Python executable.
+
+    Returns
+    -------
+    list[Path]
+        Candidate directories ordered by preference.
+    """
+
+    executable_path = Path(sys.executable).expanduser().resolve()
+    candidate_directories: list[Path] = []
+
+    executable_candidates = [executable_path]
+    for launcher_name in ("qgis", "QGIS"):
+        launcher_path = executable_path.parent / launcher_name
+        if launcher_path.exists():
+            executable_candidates.append(launcher_path.resolve())
+
+    for candidate_executable in executable_candidates:
+        macos_directory = candidate_executable.parent
+        contents_directory = macos_directory.parent
+        if (
+            macos_directory.name == "MacOS"
+            and contents_directory.name == "Contents"
+            and contents_directory.parent.suffix == ".app"
+        ):
+            qgis_bundle_proj_directory = (
+                contents_directory / "Resources" / "qgis" / "proj"
+            )
+            if qgis_bundle_proj_directory not in candidate_directories:
+                candidate_directories.append(qgis_bundle_proj_directory)
+
+        for relative_path in (
+            Path("../share/proj"),
+            Path("../share/qgis/proj"),
+            Path("share/proj"),
+        ):
+            sibling_candidate = (candidate_executable.parent / relative_path).resolve()
+            if sibling_candidate not in candidate_directories:
+                candidate_directories.append(sibling_candidate)
+
+    return candidate_directories
+
+
+def _candidate_proj_directories_from_prefix(prefix_path: Path) -> list[Path]:
+    """Return PROJ directories discovered inside the active prefix.
+
+    Parameters
+    ----------
+    prefix_path : Path
+        Active Python prefix.
+
+    Returns
+    -------
+    list[Path]
+        Candidate directories ordered by preference.
+    """
+
+    candidate_directories: list[Path] = []
+    bundled_patterns = (
+        "lib/python*/site-packages/rasterio/proj_data",
+        "Lib/site-packages/rasterio/proj_data",
+        "lib/python*/site-packages/pyogrio/proj_data",
+        "Lib/site-packages/pyogrio/proj_data",
+        "lib/python*/site-packages/pyproj/proj_dir/share/proj",
+        "Lib/site-packages/pyproj/proj_dir/share/proj",
+    )
+    for pattern in bundled_patterns:
+        for matched_path in sorted(prefix_path.glob(pattern)):
+            if matched_path not in candidate_directories:
+                candidate_directories.append(matched_path)
+
+    prefix_share_proj = prefix_path / "share" / "proj"
+    if prefix_share_proj not in candidate_directories:
+        candidate_directories.append(prefix_share_proj)
+    return candidate_directories
+
+
+def _candidate_proj_directories_from_module_origin(
+    module_origin: Path | None,
+) -> list[Path]:
+    """Return candidate PROJ directories derived from a module location.
+
+    Parameters
+    ----------
+    module_origin : Path | None
+        Origin path of a resolved dependency module.
+
+    Returns
+    -------
+    list[Path]
+        Candidate directories ordered by preference.
+    """
+
+    if module_origin is None:
+        return []
+
+    candidate_directories: list[Path] = []
+    module_base_directory = module_origin.parent
+    local_candidates = (
+        module_base_directory / "proj_data",
+        module_base_directory / "proj_dir" / "share" / "proj",
+        module_base_directory.parent / "pyproj" / "proj_dir" / "share" / "proj",
+        module_base_directory.parent / "rasterio" / "proj_data",
+        module_base_directory.parent / "pyogrio" / "proj_data",
+    )
+    for candidate_directory in local_candidates:
+        if candidate_directory not in candidate_directories:
+            candidate_directories.append(candidate_directory)
+    return candidate_directories
+
+
+def _resolve_proj_data_directory(prefix_path: Path) -> Path | None:
+    """Return a compatible PROJ data directory for the active runtime.
+
+    Parameters
+    ----------
+    prefix_path : Path
+        Active Python prefix.
+
+    Returns
+    -------
+    Path | None
+        Directory that contains ``proj.db`` or ``None`` when nothing suitable
+        can be found.
+    """
+
+    candidate_directories: list[Path] = []
+    for candidate_directory in _candidate_proj_directories_from_sys_executable():
+        if candidate_directory not in candidate_directories:
+            candidate_directories.append(candidate_directory)
+
+    for candidate_directory in _candidate_proj_directories_from_prefix(prefix_path):
+        if candidate_directory not in candidate_directories:
+            candidate_directories.append(candidate_directory)
+
+    for module_name in ("rasterio", "pyogrio", "pyproj"):
+        module_origin = module_spec_origin_path(module_name)
+        for candidate_directory in _candidate_proj_directories_from_module_origin(
+            module_origin
+        ):
+            if candidate_directory not in candidate_directories:
+                candidate_directories.append(candidate_directory)
+
+    for candidate_directory in candidate_directories:
+        if not candidate_directory.exists():
+            continue
+        if not (candidate_directory / "proj.db").exists():
+            logger.warning(
+                "Ignoring PROJ directory without proj.db: %s",
+                candidate_directory,
+            )
+            continue
+        return candidate_directory
+    return None
+
+
 def _is_relative_to(path: Path, other_path: Path) -> bool:
     """Return whether ``path`` is relative to ``other_path``.
 
@@ -97,28 +254,48 @@ def configure_native_data_paths() -> None:
 
     Notes
     -----
-    This function only fills missing environment variables. Existing values are
-    preserved so external QGIS launch scripts can still override them.
+    ``PROJ_LIB`` and ``PROJ_DATA`` are aligned with the runtime's compatible
+    PROJ database directory to avoid mixing one PROJ library with another
+    installation's ``proj.db``. ``GDAL_DATA`` is still filled only when
+    missing.
     """
 
     prefix_path = Path(sys.prefix).expanduser().resolve()
-    environment_defaults = {
-        "PROJ_LIB": prefix_path / "share" / "proj",
-        "GDAL_DATA": prefix_path / "share" / "gdal",
-    }
-
-    for environment_name, directory_path in environment_defaults.items():
-        if os.environ.get(environment_name):
-            continue
-        if not directory_path.exists():
-            logger.warning(
-                "Expected runtime data directory for %s does not exist: %s",
-                environment_name,
-                directory_path,
+    proj_data_directory = _resolve_proj_data_directory(prefix_path)
+    if proj_data_directory is None:
+        logger.warning(
+            "No compatible PROJ data directory was found under the active prefix: %s",
+            prefix_path,
+        )
+    else:
+        for environment_name in ("PROJ_LIB", "PROJ_DATA"):
+            current_proj_path = os.environ.get(environment_name)
+            resolved_current_proj_path = (
+                _normalize_path(current_proj_path) if current_proj_path else None
             )
-            continue
-        os.environ[environment_name] = str(directory_path)
-        logger.info("Configured %s=%s", environment_name, directory_path)
+            if resolved_current_proj_path == proj_data_directory:
+                continue
+            if current_proj_path:
+                logger.warning(
+                    "Overriding incompatible %s=%s with %s",
+                    environment_name,
+                    current_proj_path,
+                    proj_data_directory,
+                )
+            else:
+                logger.info("Configured %s=%s", environment_name, proj_data_directory)
+            os.environ[environment_name] = str(proj_data_directory)
+
+    gdal_data_directory = prefix_path / "share" / "gdal"
+    if not os.environ.get("GDAL_DATA"):
+        if not gdal_data_directory.exists():
+            logger.warning(
+                "Expected runtime data directory for GDAL_DATA does not exist: %s",
+                gdal_data_directory,
+            )
+            return
+        os.environ["GDAL_DATA"] = str(gdal_data_directory)
+        logger.info("Configured GDAL_DATA=%s", gdal_data_directory)
 
 
 def _module_name_matches_prefixes(

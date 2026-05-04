@@ -50,11 +50,29 @@
           </property>
           <layout class="QVBoxLayout" name="sourceGroupLayout">
            <item>
+            <layout class="QHBoxLayout" name="layerRowLayout">
+             <item>
+              <widget class="QComboBox" name="rasterLayerComboBox">
+               <property name="placeholderText">
+                <string/>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QPushButton" name="loadLayerButton">
+               <property name="text">
+                <string>Load</string>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
             <layout class="QHBoxLayout" name="sourceRowLayout">
              <item>
               <widget class="QgsFileWidget" name="datasetPathFileWidget">
                <property name="filter">
-                <string>InSAR data (*.nc *.nc4 *.cdf *.h5 *.hdf5 *.he5);;All files (*)</string>
+                <string>Raster data (*.nc *.nc4 *.cdf *.h5 *.hdf5 *.he5 *.tif *.tiff);;All files (*)</string>
                </property>
               </widget>
              </item>
@@ -94,7 +112,7 @@
            <item>
             <widget class="QGroupBox" name="gridGroupBox_2">
              <property name="title">
-              <string>Time</string>
+              <string>Band / Time</string>
              </property>
              <property name="alignment">
               <set>Qt::AlignCenter</set>

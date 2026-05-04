@@ -238,13 +238,76 @@ def suggest_dimensions(
         variable_dimensions,
         LONGITUDE_DIMENSION_ALIASES,
     )
-    if not time_name or not latitude_name or not longitude_name:
+    if not latitude_name or not longitude_name:
         return None
+    if not time_name:
+        remaining_dimensions = [
+            dimension_name
+            for dimension_name in variable_dimensions
+            if dimension_name not in {latitude_name, longitude_name}
+        ]
+        if len(remaining_dimensions) != 1:
+            return None
+        time_name = remaining_dimensions[0]
     return DimensionSelection(
         time=time_name,
         latitude=latitude_name,
         longitude=longitude_name,
     )
+
+
+def _build_default_axis_coordinate(size: int) -> np.ndarray:
+    """Return a 1-based default coordinate for a stack dimension.
+
+    Parameters
+    ----------
+    size : int
+        Axis length.
+
+    Returns
+    -------
+    np.ndarray
+        Generated coordinate values.
+    """
+
+    return np.arange(1, size + 1, dtype=int)
+
+
+def _coordinate_values_are_temporal(coordinate_values: np.ndarray) -> bool:
+    """Return whether a coordinate array looks temporal.
+
+    Parameters
+    ----------
+    coordinate_values : np.ndarray
+        Coordinate values for the stack dimension.
+
+    Returns
+    -------
+    bool
+        ``True`` when the values appear to describe dates or datetimes.
+    """
+
+    flattened_values = np.asarray(coordinate_values).reshape(-1)
+    if flattened_values.size == 0:
+        return False
+
+    sample_size = min(5, flattened_values.size)
+    temporal_matches = 0
+    for value in flattened_values[:sample_size]:
+        normalized_value = str(value).strip()
+        if not normalized_value:
+            continue
+        if (
+            "T" in normalized_value
+            or "-" in normalized_value
+            or "/" in normalized_value
+        ):
+            temporal_matches += 1
+            continue
+        if len(normalized_value) >= 8 and normalized_value[:8].isdigit():
+            temporal_matches += 1
+
+    return temporal_matches > 0
 
 
 def inspect_dataset(dataset_path: Path) -> DatasetInspection:
@@ -325,6 +388,8 @@ class InSARDataset:
         CRS WKT or authority string discovered from ``rio.crs`` when available.
     is_geographic : bool
         Whether the detected CRS is geographic.
+    is_temporal : bool
+        Whether the stack dimension appears to represent time.
     """
 
     source_path: Path
@@ -333,6 +398,7 @@ class InSARDataset:
     data_array: xr.DataArray
     crs_wkt: str | None
     is_geographic: bool
+    is_temporal: bool
 
     @classmethod
     def load(
@@ -403,9 +469,6 @@ class InSARDataset:
                 "Variable %s is missing latitude/longitude coordinates.", variable_name
             )
             raise RuntimeError("Latitude and longitude coordinates are required.")
-        if time_coordinate is None:
-            logger.error("Variable %s is missing a time coordinate.", variable_name)
-            raise RuntimeError("A time coordinate is required.")
         if latitude_coordinate.ndim != 1 or longitude_coordinate.ndim != 1:
             logger.error(
                 "Only 1D latitude/longitude coordinates are supported, got %s and %s.",
@@ -415,6 +478,18 @@ class InSARDataset:
             raise RuntimeError(
                 "Only 1D latitude and longitude coordinates are currently supported."
             )
+
+        if time_coordinate is None:
+            stack_size = int(data_array.sizes[dimensions.time])
+            data_array = data_array.assign_coords(
+                {dimensions.time: _build_default_axis_coordinate(stack_size)}
+            )
+            time_coordinate = data_array.coords.get(dimensions.time)
+        is_temporal = (
+            False
+            if time_coordinate is None
+            else _coordinate_values_are_temporal(np.asarray(time_coordinate.values))
+        )
 
         renamed = data_array.rename(
             {
@@ -432,6 +507,7 @@ class InSARDataset:
             data_array=normalized,
             crs_wkt=crs_wkt,
             is_geographic=is_geographic,
+            is_temporal=is_temporal,
         )
 
     @staticmethod
@@ -480,11 +556,18 @@ class InSARDataset:
         return np.asarray(self.data_array.coords["latitude"].values, dtype=float)
 
     def time_labels(self) -> list[str]:
-        """Return formatted labels for all time steps."""
+        """Return labels for all stack positions."""
 
         labels: list[str] = []
-        for value in self.data_array.coords["time"].values:
-            labels.append(str(value))
+        for index, value in enumerate(self.data_array.coords["time"].values, start=1):
+            if self.is_temporal:
+                labels.append(str(value))
+                continue
+            normalized_value = str(value).strip()
+            if not normalized_value:
+                labels.append(f"Band {index}")
+                continue
+            labels.append(f"Band {normalized_value}")
         return labels
 
     def _extract_point_series(

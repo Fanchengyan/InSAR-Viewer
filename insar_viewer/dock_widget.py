@@ -189,7 +189,10 @@ class InSARViewerDockWidget(QDockWidget):
 
         self._configure_static_controls()
         self._connect_signals()
+        QgsProject.instance().layersAdded.connect(self._refresh_raster_layer_combo)
+        QgsProject.instance().layersRemoved.connect(self._refresh_raster_layer_combo)
         self._set_selection_controls_enabled(False)
+        self._refresh_raster_layer_combo()
         self._refresh_dependency_statuses()
         self._refresh_point_lists()
         self._refresh_canvas_markers()
@@ -213,10 +216,12 @@ class InSARViewerDockWidget(QDockWidget):
             "colorRampComboBox",
             "compareDateComboBox",
             "datasetPathFileWidget",
+            "dateRenderGroupBox",
             "dependenciesInfoLabel",
             "dependenciesTableWidget",
             "dependencyInstallLogTextEdit",
             "displayDateSlider",
+            "displayDateSliderLabel",
             "exportPointSeriesCsvButton",
             "installDependenciesButton",
             "jumpToFirstDateButton",
@@ -224,6 +229,7 @@ class InSARViewerDockWidget(QDockWidget):
             "latitudeDimensionComboBox",
             "liveRenderCheckBox",
             "liveSeriesProbeCheckBox",
+            "loadLayerButton",
             "loadSourceButton",
             "longitudeDimensionComboBox",
             "maxValueDoubleSpinBox",
@@ -233,7 +239,9 @@ class InSARViewerDockWidget(QDockWidget):
             "pointPlotEndComboBox",
             "pointPlotPlaceholder",
             "pointPlotStartComboBox",
+            "rasterLayerComboBox",
             "referenceColorButton",
+            "referenceDateLabel",
             "referenceDateComboBox",
             "referencePointsListWidget",
             "referenceShapeComboBox",
@@ -249,6 +257,7 @@ class InSARViewerDockWidget(QDockWidget):
             "seriesSizeSpinBox",
             "stepToNextDateButton",
             "stepToPreviousDateButton",
+            "compareDateLabel",
             "timeDimensionComboBox",
             "variableComboBox",
         )
@@ -302,8 +311,10 @@ class InSARViewerDockWidget(QDockWidget):
         self.selectionGroupBox.setEnabled(False)
         self.datasetPathFileWidget.setStorageMode(QgsFileWidget.GetFile)
         self.datasetPathFileWidget.setFilter(
-            "InSAR data (*.nc *.nc4 *.cdf *.h5 *.hdf5 *.he5);;All files (*)"
+            "Raster data (*.nc *.nc4 *.cdf *.h5 *.hdf5 *.he5 *.tif *.tiff);;"
+            "All files (*)"
         )
+        self._set_stack_axis_ui_labels(is_temporal=True)
 
         self.referenceShapeComboBox.addItems(POINT_SHAPE_NAMES)
         self.seriesShapeComboBox.addItems(POINT_SHAPE_NAMES)
@@ -376,6 +387,7 @@ class InSARViewerDockWidget(QDockWidget):
         """Connect UI signals to handlers."""
 
         self.loadSourceButton.clicked.connect(self._load_source_dataset)
+        self.loadLayerButton.clicked.connect(self._load_selected_raster_layer)
         self.variableComboBox.currentTextChanged.connect(self._handle_variable_change)
         self.timeDimensionComboBox.currentTextChanged.connect(
             self._apply_dataset_selection
@@ -479,6 +491,125 @@ class InSARViewerDockWidget(QDockWidget):
             self._install_missing_dependencies
         )
 
+    def _set_stack_axis_ui_labels(self, is_temporal: bool) -> None:
+        """Update labels that describe the active stack axis.
+
+        Parameters
+        ----------
+        is_temporal : bool
+            Whether the active stack axis represents time.
+        """
+
+        axis_noun = "Date" if is_temporal else "Band"
+        self.dateRenderGroupBox.setTitle(f"{axis_noun} Render")
+        self.referenceDateLabel.setText(f"Reference {axis_noun}")
+        self.compareDateLabel.setText(f"Display {axis_noun}")
+        self.displayDateSliderLabel.setText(f"{axis_noun} Slider")
+
+    def _refresh_raster_layer_combo(self, *args: object) -> None:
+        """Refresh the raster-layer selector from the current QGIS project."""
+
+        selected_layer_id = self.rasterLayerComboBox.currentData()
+        raster_layers = [
+            layer
+            for layer in QgsProject.instance().mapLayers().values()
+            if isinstance(layer, QgsRasterLayer)
+            and layer.isValid()
+            and layer.id() != self.preview_layer_id
+            and Path(layer.source().split("|", maxsplit=1)[0].strip())
+            != self.preview_raster_path
+        ]
+        raster_layers.sort(key=lambda layer: layer.name().casefold())
+
+        self._is_updating_ui = True
+        try:
+            self.rasterLayerComboBox.clear()
+            self.rasterLayerComboBox.addItem("", None)
+            for raster_layer in raster_layers:
+                self.rasterLayerComboBox.addItem(
+                    raster_layer.name(),
+                    raster_layer.id(),
+                )
+            if selected_layer_id is not None:
+                selected_index = self.rasterLayerComboBox.findData(selected_layer_id)
+                if selected_index >= 0:
+                    self.rasterLayerComboBox.setCurrentIndex(selected_index)
+        finally:
+            self._is_updating_ui = False
+
+    def _selected_raster_layer(self) -> QgsRasterLayer | None:
+        """Return the raster layer selected in the layer combo-box."""
+
+        layer_id = self.rasterLayerComboBox.currentData()
+        if not isinstance(layer_id, str) or not layer_id:
+            return None
+        layer = QgsProject.instance().mapLayer(layer_id)
+        if not isinstance(layer, QgsRasterLayer) or not layer.isValid():
+            return None
+        return layer
+
+    def _extract_raster_layer_source_path(
+        self,
+        raster_layer: QgsRasterLayer,
+    ) -> Path | None:
+        """Extract a filesystem path from a QGIS raster-layer source.
+
+        Parameters
+        ----------
+        raster_layer : QgsRasterLayer
+            Raster layer chosen in the UI.
+
+        Returns
+        -------
+        Path | None
+            Parsed filesystem path when one can be derived.
+        """
+
+        source_text = raster_layer.source().strip()
+        if not source_text:
+            return None
+
+        cleaned_source = source_text.split("|", maxsplit=1)[0].strip()
+        if (
+            cleaned_source.startswith(("NETCDF:", "HDF5:", "HDF4:"))
+            and '"' in cleaned_source
+        ):
+            source_parts = cleaned_source.split('"')
+            if len(source_parts) >= 3:
+                cleaned_source = source_parts[1].strip()
+        if not cleaned_source:
+            return None
+        return Path(cleaned_source)
+
+    def _start_dataset_inspection(self, dataset_path: Path) -> None:
+        """Reset runtime state and inspect a dataset path.
+
+        Parameters
+        ----------
+        dataset_path : Path
+            Dataset path to inspect and prepare for loading.
+        """
+
+        self._cancel_dataset_inspection_task()
+        self._cancel_dataset_load_task()
+        self.dataset_path = dataset_path
+        self.dataset_inspection = None
+        self.dataset = None
+        self.remove_preview_layer()
+        self._cancel_live_probe_task()
+        self.live_probe_point = None
+        self.pending_live_probe_point = None
+        self.overlay_manager.clear_role("live_probe")
+        self._refresh_point_plot()
+        self._set_selection_controls_enabled(False)
+        self.loadSourceButton.setEnabled(False)
+        self.loadLayerButton.setEnabled(False)
+
+        task = DatasetInspectionTask(self.dataset_path)
+        task.inspectionFinished.connect(self._handle_dataset_inspection_finished)
+        self.dataset_inspection_task = task
+        QgsApplication.taskManager().addTask(task)
+
     def _set_selection_controls_enabled(self, enabled: bool) -> None:
         """Enable or disable dataset-selection controls."""
 
@@ -575,25 +706,34 @@ class InSARViewerDockWidget(QDockWidget):
         if not dataset_text:
             self._show_error_message("Missing Dataset", "Select a dataset path first.")
             return
+        self._start_dataset_inspection(Path(dataset_text))
 
-        self._cancel_dataset_inspection_task()
-        self._cancel_dataset_load_task()
-        self.dataset_path = Path(dataset_text)
-        self.dataset_inspection = None
-        self.dataset = None
-        self.remove_preview_layer()
-        self._cancel_live_probe_task()
-        self.live_probe_point = None
-        self.pending_live_probe_point = None
-        self.overlay_manager.clear_role("live_probe")
-        self._refresh_point_plot()
-        self._set_selection_controls_enabled(False)
-        self.loadSourceButton.setEnabled(False)
+    def _load_selected_raster_layer(self) -> None:
+        """Inspect the dataset referenced by the selected raster layer."""
 
-        task = DatasetInspectionTask(self.dataset_path)
-        task.inspectionFinished.connect(self._handle_dataset_inspection_finished)
-        self.dataset_inspection_task = task
-        QgsApplication.taskManager().addTask(task)
+        raster_layer = self._selected_raster_layer()
+        if raster_layer is None:
+            self._show_error_message(
+                "Missing Raster Layer",
+                "Select a raster layer from the list first.",
+            )
+            return
+
+        dataset_path = self._extract_raster_layer_source_path(raster_layer)
+        if dataset_path is None or not dataset_path.exists():
+            logger.error(
+                "Failed to resolve a readable dataset path for raster layer %s: %s",
+                raster_layer.name(),
+                raster_layer.source(),
+            )
+            self._show_error_message(
+                "Invalid Raster Layer Source",
+                "The selected raster layer does not reference a readable local file.",
+            )
+            return
+
+        self.datasetPathFileWidget.setFilePath(str(dataset_path))
+        self._start_dataset_inspection(dataset_path)
 
     def _handle_dataset_inspection_finished(
         self,
@@ -606,6 +746,7 @@ class InSARViewerDockWidget(QDockWidget):
 
         self.dataset_inspection_task = None
         self.loadSourceButton.setEnabled(True)
+        self.loadLayerButton.setEnabled(True)
 
         if not isinstance(dataset_path, Path):
             logger.error(
@@ -813,6 +954,7 @@ class InSARViewerDockWidget(QDockWidget):
             return
 
         self.dataset = dataset
+        self._set_stack_axis_ui_labels(is_temporal=self.dataset.is_temporal)
         self._populate_time_controls()
         self.remove_preview_layer()
         self._refresh_value_range_from_data()
@@ -833,7 +975,7 @@ class InSARViewerDockWidget(QDockWidget):
             )
 
     def _populate_time_controls(self) -> None:
-        """Populate all time-aware controls from the current dataset."""
+        """Populate stack-axis controls from the current dataset."""
 
         if self.dataset is None:
             return
@@ -847,8 +989,9 @@ class InSARViewerDockWidget(QDockWidget):
         self._is_updating_ui = True
         self.referenceDateComboBox.clear()
         self.referenceDateComboBox.addItem("None", None)
-        for index, label in enumerate(time_labels):
-            self.referenceDateComboBox.addItem(label, index)
+        if self.dataset.is_temporal:
+            for index, label in enumerate(time_labels):
+                self.referenceDateComboBox.addItem(label, index)
         for combo_box in combo_groups:
             combo_box.clear()
             for index, label in enumerate(time_labels):
@@ -856,6 +999,8 @@ class InSARViewerDockWidget(QDockWidget):
         last_index = max(0, len(time_labels) - 1)
         self.compareDateComboBox.setCurrentIndex(0)
         self.referenceDateComboBox.setCurrentIndex(0)
+        self.referenceDateComboBox.setEnabled(self.dataset.is_temporal)
+        self.referenceDateLabel.setEnabled(self.dataset.is_temporal)
         self.displayDateSlider.setMinimum(0)
         self.displayDateSlider.setMaximum(last_index)
         self.displayDateSlider.setValue(0)
@@ -873,7 +1018,11 @@ class InSARViewerDockWidget(QDockWidget):
     def _current_reference_index(self) -> int | None:
         """Return the current reference-date index or ``None``."""
 
-        if self.referenceDateComboBox.count() == 0:
+        if (
+            self.dataset is None
+            or not self.dataset.is_temporal
+            or self.referenceDateComboBox.count() == 0
+        ):
             return None
         data = self.referenceDateComboBox.currentData()
         if data is None:
@@ -1156,7 +1305,12 @@ class InSARViewerDockWidget(QDockWidget):
             return
 
         compare_label = self.compareDateComboBox.currentText()
-        layer_name = f"InSAR Date Band | {compare_label}"
+        layer_prefix = (
+            "InSAR Date Band"
+            if self.dataset is None or self.dataset.is_temporal
+            else "InSAR Raster Band"
+        )
+        layer_name = f"{layer_prefix} | {compare_label}"
         preview_layer = QgsRasterLayer(str(self.preview_raster_path), layer_name)
         if not preview_layer.isValid():
             logger.error(
@@ -1737,8 +1891,8 @@ class InSARViewerDockWidget(QDockWidget):
         if self.preview_layer_id is None:
             return None
 
-        layer_tree_layer = QgsProject.instance().layerTreeRoot().findLayer(
-            self.preview_layer_id
+        layer_tree_layer = (
+            QgsProject.instance().layerTreeRoot().findLayer(self.preview_layer_id)
         )
         if layer_tree_layer is None:
             return None

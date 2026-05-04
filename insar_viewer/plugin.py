@@ -38,9 +38,7 @@ class InSARViewerPlugin:
 
         self.action = QAction("InSAR Viewer", self.iface.mainWindow())
         icon_path = (
-            Path(__file__).resolve().parents[1]
-            / "assets"
-            / "insar_viewer_icon.svg"
+            Path(__file__).resolve().parents[1] / "assets" / "insar_viewer_icon.svg"
         )
         self.action.setIcon(QIcon(str(icon_path)))
         self.action.triggered.connect(self.run)

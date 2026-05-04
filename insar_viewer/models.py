@@ -9,12 +9,13 @@ from .constants import PointShape
 
 @dataclass(frozen=True)
 class DimensionSelection:
-    """Selected coordinate dimensions for an InSAR variable.
+    """Selected stack and spatial dimensions for a raster variable.
 
     Attributes
     ----------
     time : str
-        Name of the temporal dimension.
+        Name of the stack dimension. This may represent time or a generic band
+        axis depending on the dataset metadata.
     latitude : str
         Name of the latitude dimension.
     longitude : str

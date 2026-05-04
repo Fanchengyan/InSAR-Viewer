@@ -163,9 +163,7 @@ def missing_dependencies() -> list[DependencySpec]:
     """
 
     return [
-        status.dependency
-        for status in dependency_statuses()
-        if not status.installed
+        status.dependency for status in dependency_statuses() if not status.installed
     ]
 
 

@@ -272,12 +272,9 @@ class TimeSeriesPlotWidget(QWidget):
 
                 x_distance = abs(x_value - cursor_view_position.x())
                 y_distance = abs(y_value - cursor_view_position.y())
-                if (
-                    x_distance < min_x_distance
-                    or (
-                        math.isclose(x_distance, min_x_distance)
-                        and y_distance < min_y_distance
-                    )
+                if x_distance < min_x_distance or (
+                    math.isclose(x_distance, min_x_distance)
+                    and y_distance < min_y_distance
                 ):
                     min_x_distance = x_distance
                     min_y_distance = y_distance
