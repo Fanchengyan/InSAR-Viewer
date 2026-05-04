@@ -132,6 +132,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.deps/
 env/
 venv/
 ENV/
@@ -171,4 +172,3 @@ cython_debug/
 .opencode
 .claude
 .vscode
-

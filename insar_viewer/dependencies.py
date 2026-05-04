@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import importlib.metadata
 import importlib.util
 import os
@@ -70,6 +71,8 @@ class DependencyStatus:
         Dependency source shown in the UI.
     origin : Path | None
         Resolved module origin path when available.
+    error_message : str | None
+        Import error text when the dependency is present but unusable.
     """
 
     dependency: DependencySpec
@@ -77,6 +80,7 @@ class DependencyStatus:
     version: str | None
     source: str
     origin: Path | None
+    error_message: str | None = None
 
 
 REQUIRED_DEPENDENCIES: tuple[DependencySpec, ...] = (
@@ -149,10 +153,8 @@ def dependency_statuses() -> list[DependencyStatus]:
         ("pyproj", "rasterio", "rioxarray", "xarray", "cftime")
     ):
         for dependency in REQUIRED_DEPENDENCIES:
-            module_origin = module_spec_origin_path(dependency.import_name)
-            installed = module_origin is not None
-            if installed and dependency.import_name in {"pyproj", "rasterio"}:
-                installed = is_module_origin_supported(module_origin)
+            module_origin, import_error = _probe_dependency_import(dependency)
+            installed = module_origin is not None and import_error is None
             version = (
                 _distribution_version(dependency.package_name) if installed else None
             )
@@ -163,6 +165,7 @@ def dependency_statuses() -> list[DependencyStatus]:
                     version=version,
                     source=_dependency_source(module_origin) if installed else "-",
                     origin=module_origin,
+                    error_message=import_error,
                 )
             )
     return statuses
@@ -200,6 +203,50 @@ def _distribution_version(package_name: str) -> str | None:
         return importlib.metadata.version(package_name)
     except importlib.metadata.PackageNotFoundError:
         return None
+
+
+def _probe_dependency_import(
+    dependency: DependencySpec,
+) -> tuple[Path | None, str | None]:
+    """Import a dependency and return its origin plus any import error.
+
+    Parameters
+    ----------
+    dependency : DependencySpec
+        Dependency to import.
+
+    Returns
+    -------
+    tuple[Path | None, str | None]
+        Module origin and import error text. The error is ``None`` when the
+        dependency can be imported from a supported location.
+    """
+
+    module_origin = module_spec_origin_path(dependency.import_name)
+    if module_origin is None:
+        return None, None
+    try:
+        importlib.import_module(dependency.import_name)
+    except ImportError as exc:
+        logger.warning(
+            "Dependency %s was found at %s but could not be imported: %s",
+            dependency.import_name,
+            module_origin,
+            exc,
+        )
+        return module_origin, str(exc)
+
+    module_origin = module_spec_origin_path(dependency.import_name)
+    if dependency.import_name in {"pyproj", "rasterio"} and not (
+        is_module_origin_supported(module_origin)
+    ):
+        error_message = (
+            f"{dependency.import_name} resolved outside QGIS and InSAR Viewer "
+            f"managed paths: {module_origin}"
+        )
+        logger.warning(error_message)
+        return module_origin, error_message
+    return module_origin, None
 
 
 def _dependency_source(module_origin: Path | None) -> str:
@@ -591,6 +638,7 @@ class DependencyInstallTask(QgsTask):
             str(constraints_file),
             "--disable-pip-version-check",
             "--no-warn-script-location",
+            "--upgrade",
             "--upgrade-strategy",
             "only-if-needed",
             *[dependency.pip_spec for dependency in self.dependencies],

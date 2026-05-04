@@ -75,7 +75,11 @@ def _import_rioxarray() -> Any:
             import rioxarray
     except ImportError as exc:
         logger.error("rioxarray is required to load raster datasets: %s", exc)
-        raise RuntimeError("rioxarray is required to load raster datasets.") from exc
+        raise RuntimeError(
+            "rioxarray or one of its dependencies could not be imported: "
+            f"{exc}. Open the Dependencies tab, refresh the status, and reinstall "
+            "items marked as missing or broken."
+        ) from exc
     ensure_module_origin_in_active_prefix("pyproj", pyproj)
     ensure_module_origin_in_active_prefix("rasterio", rasterio)
     return rioxarray

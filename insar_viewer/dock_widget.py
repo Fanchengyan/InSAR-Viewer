@@ -641,7 +641,9 @@ class InSARViewerDockWidget(QDockWidget):
         for row_index, status in enumerate(statuses):
             dependency = status.dependency
             status_text = "Installed" if status.installed else "Missing"
-            if not dependency.required and not status.installed:
+            if status.error_message:
+                status_text = "Broken"
+            elif not dependency.required and not status.installed:
                 status_text = "Missing (Optional)"
 
             row_items = (
@@ -653,6 +655,8 @@ class InSARViewerDockWidget(QDockWidget):
             status_color = QColor("#1a9850") if status.installed else QColor("#d73027")
             for column_index, item in enumerate(row_items):
                 item.setForeground(status_color)
+                if status.error_message:
+                    item.setToolTip(status.error_message)
                 self.dependenciesTableWidget.setItem(row_index, column_index, item)
 
         missing_count = sum(1 for status in statuses if not status.installed)
